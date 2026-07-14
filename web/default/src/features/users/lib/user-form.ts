@@ -41,6 +41,8 @@ export const userFormSchema = z.object({
   quota_dollars: z.number().min(0).optional(),
   group: z.string().optional(),
   remark: z.string().optional(),
+  request_rate_limit: z.number().min(0).optional(),
+  concurrent_limit: z.number().min(0).optional(),
   admin_permissions: z
     .record(z.string(), z.record(z.string(), z.boolean()))
     .optional(),
@@ -60,6 +62,8 @@ export const USER_FORM_DEFAULT_VALUES: UserFormValues = {
   quota_dollars: 0,
   group: DEFAULT_GROUP,
   remark: '',
+  request_rate_limit: 0,
+  concurrent_limit: 0,
   // Filled against the backend catalog at render time; see UsersMutateDrawer.
   admin_permissions: {},
 }
@@ -101,6 +105,8 @@ export function transformFormDataToPayload(
     // For update: quota is adjusted atomically via /api/user/manage, not sent here
     payload.group = data.group
     payload.remark = data.remark || undefined
+    payload.request_rate_limit = data.request_rate_limit ?? 0
+    payload.concurrent_limit = data.concurrent_limit ?? 0
     payload.id = userId
   }
 
@@ -121,6 +127,8 @@ export function transformUserToFormDefaults(user: User): UserFormValues {
     quota_dollars: quotaUnitsToDollars(user.quota),
     group: user.group || DEFAULT_GROUP,
     remark: user.remark || '',
+    request_rate_limit: user.request_rate_limit || 0,
+    concurrent_limit: user.concurrent_limit || 0,
     admin_permissions: user.admin_permissions ?? {},
   }
 }

@@ -450,6 +450,66 @@ export function UsersMutateDrawer({
                 </SideDrawerSection>
               )}
 
+              {/* Rate Limit Settings (Update only) */}
+              {isUpdate && (
+                <SideDrawerSection>
+                  <h3 className='text-sm font-medium'>
+                    {t('Rate Limit Settings')}
+                  </h3>
+                  <p className='text-muted-foreground text-xs'>
+                    {t('Set per-user request rate limits. 0 means using the global default.')}
+                  </p>
+
+                  <FormField
+                    control={form.control}
+                    name='request_rate_limit'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('RPM (Requests Per Minute)')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            type='number'
+                            min={0}
+                            {...field}
+                            value={field.value ?? 0}
+                            onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
+                            placeholder={t('0 = use global default')}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t('Maximum successful requests per minute for this user. 0 = unlimited or use global default.')}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name='concurrent_limit'
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('Concurrent Requests Limit')}</FormLabel>
+                        <FormControl>
+                          <Input
+                            type='number'
+                            min={0}
+                            {...field}
+                            value={field.value ?? 0}
+                            onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
+                            placeholder={t('0 = use global default')}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t('Maximum concurrent requests for this user. 0 = unlimited or use global default.')}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </SideDrawerSection>
+              )}
+
               {canEditAdminPermissions &&
                 targetIsAdmin &&
                 permissionCatalog.resources.length > 0 && (
