@@ -43,14 +43,16 @@ const (
 	ContextKeyAutoGroupRetryIndex ContextKey = "auto_group_retry_index"
 
 	/* user related keys */
-	ContextKeyUserId      ContextKey = "id"
-	ContextKeyUserSetting ContextKey = "user_setting"
-	ContextKeyUserQuota   ContextKey = "user_quota"
-	ContextKeyUserStatus  ContextKey = "user_status"
-	ContextKeyUserEmail   ContextKey = "user_email"
-	ContextKeyUserGroup   ContextKey = "user_group"
-	ContextKeyUsingGroup  ContextKey = "group"
-	ContextKeyUserName    ContextKey = "username"
+	ContextKeyUserId           ContextKey = "id"
+	ContextKeyUserSetting      ContextKey = "user_setting"
+	ContextKeyUserQuota        ContextKey = "user_quota"
+	ContextKeyUserStatus       ContextKey = "user_status"
+	ContextKeyUserEmail        ContextKey = "user_email"
+	ContextKeyUserGroup        ContextKey = "user_group"
+	ContextKeyUsingGroup       ContextKey = "group"
+	ContextKeyUserName         ContextKey = "username"
+	ContextKeyUserRateLimit    ContextKey = "user_rate_limit"    // 用户级别 RPM 限制
+	ContextKeyUserConcurrency  ContextKey = "user_concurrency"   // 用户级别并发限制
 
 	ContextKeyLocalCountTokens ContextKey = "local_count_tokens"
 

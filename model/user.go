@@ -48,6 +48,8 @@ type User struct {
 	DeletedAt        gorm.DeletedAt             `gorm:"index"`
 	LinuxDOId        string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
 	Setting          string                     `json:"setting" gorm:"type:text;column:setting"`
+	RequestRateLimit int                        `json:"request_rate_limit" gorm:"type:int;default:0;column:request_rate_limit"` // 用户级别 RPM 限制，0 表示使用全局默认值
+	ConcurrentLimit  int                        `json:"concurrent_limit" gorm:"type:int;default:0;column:concurrent_limit"`    // 用户级别并发请求限制，0 表示使用全局默认值
 	Remark           string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
 	StripeCustomer   string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
 	CreatedAt        int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
@@ -57,13 +59,15 @@ type User struct {
 
 func (user *User) ToBaseUser() *UserBase {
 	cache := &UserBase{
-		Id:       user.Id,
-		Group:    user.Group,
-		Quota:    user.Quota,
-		Status:   user.Status,
-		Username: user.Username,
-		Setting:  user.Setting,
-		Email:    user.Email,
+		Id:               user.Id,
+		Group:            user.Group,
+		Quota:            user.Quota,
+		Status:           user.Status,
+		Username:         user.Username,
+		Setting:          user.Setting,
+		Email:            user.Email,
+		RequestRateLimit: user.RequestRateLimit,
+		ConcurrentLimit:  user.ConcurrentLimit,
 	}
 	return cache
 }
@@ -688,10 +692,12 @@ func (user *User) EditWithTx(tx *gorm.DB, updatePassword bool) error {
 
 	newUser := *user
 	updates := map[string]interface{}{
-		"username":     newUser.Username,
-		"display_name": newUser.DisplayName,
-		"group":        newUser.Group,
-		"remark":       newUser.Remark,
+		"username":           newUser.Username,
+		"display_name":       newUser.DisplayName,
+		"group":              newUser.Group,
+		"remark":             newUser.Remark,
+		"request_rate_limit": newUser.RequestRateLimit,
+		"concurrent_limit":   newUser.ConcurrentLimit,
 	}
 	if updatePassword {
 		updates["password"] = newUser.Password

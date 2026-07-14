@@ -16,6 +16,10 @@ var ModelRequestRateLimitSuccessCount = 1000
 var ModelRequestRateLimitGroup = map[string][2]int{}
 var ModelRequestRateLimitMutex sync.RWMutex
 
+// 用户级别默认限制（管理员可通过系统设置修改全局默认值，也可单独为用户设置覆盖值）
+var DefaultUserRequestRateLimit = 0 // 默认用户 RPM 限制，0 表示不限制
+var DefaultUserConcurrentLimit = 0  // 默认用户并发请求限制，0 表示不限制
+
 func ModelRequestRateLimitGroup2JSONString() string {
 	ModelRequestRateLimitMutex.RLock()
 	defer ModelRequestRateLimitMutex.RUnlock()

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -166,8 +167,35 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 // ModelRequestRateLimit 模型请求限流中间件
 func ModelRequestRateLimit() func(c *gin.Context) {
 	return func(c *gin.Context) {
+		// 先检查用户级别的并发限制
+		userConcurrency := common.GetContextKeyInt(c, constant.ContextKeyUserConcurrency)
+		if userConcurrency == 0 {
+			userConcurrency = setting.DefaultUserConcurrentLimit
+		}
+		if userConcurrency > 0 {
+			if !checkUserConcurrency(c, userConcurrency) {
+				return
+			}
+			// 请求结束后释放并发计数
+			defer releaseUserConcurrency(c)
+		}
+
 		// 在每个请求时检查是否启用限流
 		if !setting.ModelRequestRateLimitEnabled {
+			// 即使全局限流未启用，也检查用户级别 RPM
+			userRPM := common.GetContextKeyInt(c, constant.ContextKeyUserRateLimit)
+			if userRPM == 0 {
+				userRPM = setting.DefaultUserRequestRateLimit
+			}
+			if userRPM > 0 {
+				duration := int64(60) // 1分钟
+				if common.RedisEnabled {
+					redisRateLimitHandler(duration, 0, userRPM)(c)
+				} else {
+					memoryRateLimitHandler(duration, 0, userRPM)(c)
+				}
+				return
+			}
 			c.Next()
 			return
 		}
@@ -190,6 +218,15 @@ func ModelRequestRateLimit() func(c *gin.Context) {
 			successMaxCount = groupSuccessCount
 		}
 
+		// 用户级别 RPM 覆盖（优先级最高）
+		userRPM := common.GetContextKeyInt(c, constant.ContextKeyUserRateLimit)
+		if userRPM == 0 {
+			userRPM = setting.DefaultUserRequestRateLimit
+		}
+		if userRPM > 0 {
+			successMaxCount = userRPM
+		}
+
 		// 根据存储类型选择并执行限流处理器
 		if common.RedisEnabled {
 			redisRateLimitHandler(duration, totalMaxCount, successMaxCount)(c)
@@ -198,3 +235,78 @@ func ModelRequestRateLimit() func(c *gin.Context) {
 		}
 	}
 }
+
+
+// checkUserConcurrency 检查用户并发请求数是否超限
+// 使用 Redis INCR 或内存计数器实现
+func checkUserConcurrency(c *gin.Context, maxConcurrency int) bool {
+	userId := strconv.Itoa(c.GetInt("id"))
+	key := fmt.Sprintf("concurrency:user:%s", userId)
+
+	if common.RedisEnabled {
+		ctx := context.Background()
+		rdb := common.RDB
+		// 原子递增
+		current, err := rdb.Incr(ctx, key).Result()
+		if err != nil {
+			fmt.Println("检查并发限制失败:", err.Error())
+			// 出错时放行
+			return true
+		}
+		// 设置过期时间防止泄漏（5分钟）
+		rdb.Expire(ctx, key, 5*time.Minute)
+		if current > int64(maxConcurrency) {
+			// 超出限制，回退计数
+			rdb.Decr(ctx, key)
+			abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("您已达到并发请求限制：最多同时处理%d个请求", maxConcurrency))
+			return false
+		}
+		return true
+	}
+
+	// 内存模式：使用 inMemoryConcurrencyLimiter
+	inMemoryConcurrencyLimiter.mu.Lock()
+	defer inMemoryConcurrencyLimiter.mu.Unlock()
+	if inMemoryConcurrencyLimiter.counters == nil {
+		inMemoryConcurrencyLimiter.counters = make(map[string]int)
+	}
+	current := inMemoryConcurrencyLimiter.counters[key]
+	if current >= maxConcurrency {
+		inMemoryConcurrencyLimiter.mu.Unlock()
+		abortWithOpenAiMessage(c, http.StatusTooManyRequests, fmt.Sprintf("您已达到并发请求限制：最多同时处理%d个请求", maxConcurrency))
+		inMemoryConcurrencyLimiter.mu.Lock()
+		return false
+	}
+	inMemoryConcurrencyLimiter.counters[key] = current + 1
+	return true
+}
+
+// releaseUserConcurrency 请求完成后释放并发计数
+func releaseUserConcurrency(c *gin.Context) {
+	userId := strconv.Itoa(c.GetInt("id"))
+	key := fmt.Sprintf("concurrency:user:%s", userId)
+
+	if common.RedisEnabled {
+		ctx := context.Background()
+		rdb := common.RDB
+		result, err := rdb.Decr(ctx, key).Result()
+		if err == nil && result < 0 {
+			// 防止计数器变为负数
+			rdb.Set(ctx, key, 0, 5*time.Minute)
+		}
+		return
+	}
+
+	// 内存模式
+	inMemoryConcurrencyLimiter.mu.Lock()
+	defer inMemoryConcurrencyLimiter.mu.Unlock()
+	if inMemoryConcurrencyLimiter.counters[key] > 0 {
+		inMemoryConcurrencyLimiter.counters[key]--
+	}
+}
+
+// inMemoryConcurrencyLimiter 内存并发计数器
+var inMemoryConcurrencyLimiter = struct {
+	mu       sync.Mutex
+	counters map[string]int
+}{}
