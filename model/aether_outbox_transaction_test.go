@@ -213,6 +213,54 @@ func TestSubscriptionMutationsRollBackWhenAetherOutboxWriteFails(t *testing.T) {
 	})
 }
 
+func TestSubscriptionResetsRollBackWhenAetherOutboxWriteFails(t *testing.T) {
+	previousDB := DB
+	t.Cleanup(func() {
+		DB = previousDB
+	})
+
+	prepareMissingOutbox := func(t *testing.T, name string) *gorm.DB {
+		t.Helper()
+		db := openAetherMissingOutboxDB(t, name, &SubscriptionPlan{}, &UserSubscription{})
+		require.NoError(t, db.Where("1 = 1").Delete(&AetherIntegration{}).Error)
+		integration := &AetherIntegration{ChannelID: 96, InstanceID: "aether-reset", ExecutionMode: AetherExecutionModeDirectChannel, Enabled: true, ConfigRevision: 1}
+		require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+		require.NoError(t, db.Create(integration).Error)
+		return db
+	}
+
+	t.Run("admin batch reset", func(t *testing.T) {
+		db := prepareMissingOutbox(t, "aether_subscription_admin_reset_outbox_failure")
+		now := GetDBTimestamp()
+		plan := &SubscriptionPlan{Id: 9207, Title: "Plan", DurationUnit: SubscriptionDurationCustom, CustomSeconds: 3600, TotalAmount: 500000, QuotaResetPeriod: SubscriptionResetDaily}
+		require.NoError(t, db.Create(plan).Error)
+		subscription := &UserSubscription{UserId: 27, PlanId: plan.Id, AmountTotal: 500000, AmountUsed: 123, StartTime: now - 3600, EndTime: now + 3600, Status: "active"}
+		require.NoError(t, db.Create(subscription).Error)
+
+		_, err := AdminResetPlanSubscriptions(plan.Id, false)
+		require.Error(t, err)
+		var stored UserSubscription
+		require.NoError(t, db.First(&stored, subscription.Id).Error)
+		assert.Equal(t, int64(123), stored.AmountUsed)
+	})
+
+	t.Run("automatic due reset", func(t *testing.T) {
+		db := prepareMissingOutbox(t, "aether_subscription_due_reset_outbox_failure")
+		now := GetDBTimestamp()
+		plan := &SubscriptionPlan{Id: 9208, Title: "Plan", DurationUnit: SubscriptionDurationCustom, CustomSeconds: 30 * 24 * 3600, TotalAmount: 500000, QuotaResetPeriod: SubscriptionResetDaily}
+		require.NoError(t, db.Create(plan).Error)
+		subscription := &UserSubscription{UserId: 28, PlanId: plan.Id, AmountTotal: 500000, AmountUsed: 456, StartTime: now - 2*24*3600, EndTime: now + 30*24*3600, Status: "active", LastResetTime: now - 2*24*3600, NextResetTime: now - 24*3600}
+		require.NoError(t, db.Create(subscription).Error)
+
+		_, err := ResetDueSubscriptions(10)
+		require.Error(t, err)
+		var stored UserSubscription
+		require.NoError(t, db.First(&stored, subscription.Id).Error)
+		assert.Equal(t, int64(456), stored.AmountUsed)
+		assert.Equal(t, now-24*3600, stored.NextResetTime)
+	})
+}
+
 func openAetherMissingOutboxDB(t *testing.T, name string, models ...interface{}) *gorm.DB {
 	t.Helper()
 	db := openAetherOutboxFailureDB(t, name, models...)

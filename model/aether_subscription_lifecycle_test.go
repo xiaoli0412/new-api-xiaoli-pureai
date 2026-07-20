@@ -223,3 +223,145 @@ func TestExpireDueSubscriptionsRecordsAetherLifecycleEvent(t *testing.T) {
 	assert.Contains(t, event.Payload, `"action":"expired"`)
 	assert.NotContains(t, event.Payload, "sensitive-user")
 }
+
+func TestAdminResetPlanSubscriptionsRecordsAetherResetEventsOnlyForActualChanges(t *testing.T) {
+	previousDB := DB
+	db, err := gorm.Open(sqlite.Open("file:aether_subscription_admin_reset_lifecycle_test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+	})
+	require.NoError(t, db.AutoMigrate(&SubscriptionPlan{}, &UserSubscription{}, &AetherIntegration{}, &AetherLedgerEvent{}))
+	integration := &AetherIntegration{ChannelID: 50, InstanceID: "aether-primary", ExecutionMode: AetherExecutionModeDirectChannel, Enabled: true, ConfigRevision: 1}
+	require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+	require.NoError(t, db.Create(integration).Error)
+
+	now := GetDBTimestamp()
+	plan := &SubscriptionPlan{
+		Id:               906,
+		Title:            "Reset plan",
+		DurationUnit:     SubscriptionDurationCustom,
+		CustomSeconds:    30 * 24 * 60 * 60,
+		TotalAmount:      500_000,
+		QuotaResetPeriod: SubscriptionResetDaily,
+	}
+	require.NoError(t, db.Create(plan).Error)
+	for _, subscription := range []UserSubscription{
+		{Id: 9061, UserId: 31, PlanId: plan.Id, AmountTotal: 500_000, AmountUsed: 100, StartTime: now - 3600, EndTime: now + 30*24*3600, Status: "active", LastResetTime: now - 3600, NextResetTime: now + 3600},
+		{Id: 9062, UserId: 32, PlanId: plan.Id, AmountTotal: 500_000, AmountUsed: 200, StartTime: now - 3600, EndTime: now + 30*24*3600, Status: "active", LastResetTime: now - 3600, NextResetTime: now + 3600},
+		{Id: 9063, UserId: 33, PlanId: plan.Id, AmountTotal: 500_000, AmountUsed: 0, StartTime: now - 3600, EndTime: now + 30*24*3600, Status: "active", LastResetTime: now - 3600, NextResetTime: now + 3600},
+	} {
+		require.NoError(t, db.Create(&subscription).Error)
+	}
+
+	result, err := AdminResetPlanSubscriptions(plan.Id, false)
+	require.NoError(t, err)
+	assert.Equal(t, 3, result.ResetCount)
+
+	var events []AetherLedgerEvent
+	require.NoError(t, db.Where("event_type = ?", AetherLedgerEventSubscriptionChanged).Order("id asc").Find(&events).Error)
+	require.Len(t, events, 2)
+	for _, event := range events {
+		assert.Contains(t, event.Payload, `"action":"reset"`)
+		assert.Contains(t, event.Payload, `"amount_used":"0"`)
+	}
+
+	_, err = AdminResetPlanSubscriptions(plan.Id, false)
+	require.NoError(t, err)
+	var eventCount int64
+	require.NoError(t, db.Model(&AetherLedgerEvent{}).Where("event_type = ?", AetherLedgerEventSubscriptionChanged).Count(&eventCount).Error)
+	assert.Equal(t, int64(2), eventCount)
+}
+
+func TestResetDueSubscriptionsRecordsOneAetherResetEvent(t *testing.T) {
+	previousDB := DB
+	db, err := gorm.Open(sqlite.Open("file:aether_subscription_due_reset_lifecycle_test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+	})
+	require.NoError(t, db.AutoMigrate(&SubscriptionPlan{}, &UserSubscription{}, &AetherIntegration{}, &AetherLedgerEvent{}))
+	integration := &AetherIntegration{ChannelID: 51, InstanceID: "aether-primary", ExecutionMode: AetherExecutionModeDirectChannel, Enabled: true, ConfigRevision: 1}
+	require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+	require.NoError(t, db.Create(integration).Error)
+
+	now := GetDBTimestamp()
+	plan := &SubscriptionPlan{
+		Id:               907,
+		Title:            "Due reset plan",
+		DurationUnit:     SubscriptionDurationCustom,
+		CustomSeconds:    30 * 24 * 60 * 60,
+		TotalAmount:      500_000,
+		QuotaResetPeriod: SubscriptionResetDaily,
+	}
+	require.NoError(t, db.Create(plan).Error)
+	subscription := &UserSubscription{
+		Id: 9071, UserId: 34, PlanId: plan.Id, AmountTotal: 500_000, AmountUsed: 300,
+		StartTime: now - 2*24*3600, EndTime: now + 30*24*3600, Status: "active",
+		LastResetTime: now - 2*24*3600, NextResetTime: now - 24*3600,
+	}
+	require.NoError(t, db.Create(subscription).Error)
+
+	resetCount, err := ResetDueSubscriptions(10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, resetCount)
+	stored := UserSubscription{}
+	require.NoError(t, db.First(&stored, subscription.Id).Error)
+	assert.Zero(t, stored.AmountUsed)
+	require.Greater(t, stored.NextResetTime, now)
+
+	var events []AetherLedgerEvent
+	require.NoError(t, db.Where("event_type = ?", AetherLedgerEventSubscriptionChanged).Find(&events).Error)
+	require.Len(t, events, 1)
+	assert.Contains(t, events[0].Payload, `"action":"reset"`)
+
+	resetCount, err = ResetDueSubscriptions(10)
+	require.NoError(t, err)
+	assert.Zero(t, resetCount)
+	var eventCount int64
+	require.NoError(t, db.Model(&AetherLedgerEvent{}).Where("event_type = ?", AetherLedgerEventSubscriptionChanged).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), eventCount)
+}
+
+func TestResetDueSubscriptionsSkipsAetherEventWhenNoResetIsApplicable(t *testing.T) {
+	previousDB := DB
+	db, err := gorm.Open(sqlite.Open("file:aether_subscription_due_reset_noop_test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+	})
+	require.NoError(t, db.AutoMigrate(&SubscriptionPlan{}, &UserSubscription{}, &AetherIntegration{}, &AetherLedgerEvent{}))
+	integration := &AetherIntegration{ChannelID: 52, InstanceID: "aether-primary", ExecutionMode: AetherExecutionModeDirectChannel, Enabled: true, ConfigRevision: 1}
+	require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+	require.NoError(t, db.Create(integration).Error)
+
+	now := GetDBTimestamp()
+	plan := &SubscriptionPlan{
+		Id:               908,
+		Title:            "No reset plan",
+		DurationUnit:     SubscriptionDurationCustom,
+		CustomSeconds:    30 * 24 * 60 * 60,
+		TotalAmount:      500_000,
+		QuotaResetPeriod: SubscriptionResetNever,
+	}
+	require.NoError(t, db.Create(plan).Error)
+	subscription := &UserSubscription{
+		Id: 9081, UserId: 35, PlanId: plan.Id, AmountTotal: 500_000, AmountUsed: 400,
+		StartTime: now - 2*24*3600, EndTime: now + 30*24*3600, Status: "active",
+		LastResetTime: now - 2*24*3600, NextResetTime: now - 24*3600,
+	}
+	require.NoError(t, db.Create(subscription).Error)
+
+	resetCount, err := ResetDueSubscriptions(10)
+	require.NoError(t, err)
+	assert.Zero(t, resetCount)
+	stored := UserSubscription{}
+	require.NoError(t, db.First(&stored, subscription.Id).Error)
+	assert.Equal(t, int64(400), stored.AmountUsed)
+	var eventCount int64
+	require.NoError(t, db.Model(&AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, eventCount)
+}

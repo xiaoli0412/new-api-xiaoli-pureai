@@ -159,13 +159,14 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if redemption.ExpiredTime != 0 && redemption.ExpiredTime < common.GetTimestamp() {
 			return errors.New("该兑换码已过期")
 		}
+		redeemedAt := common.GetTimestamp()
 		// Compare-and-swap on status: only the transaction that flips
 		// enabled -> used may credit quota, so a concurrent redeem of the
 		// same code loses here even without a row lock (e.g. on SQLite).
 		result := tx.Model(&Redemption{}).
 			Where("id = ? AND status = ?", redemption.Id, common.RedemptionCodeStatusEnabled).
 			Updates(map[string]interface{}{
-				"redeemed_time": common.GetTimestamp(),
+				"redeemed_time": redeemedAt,
 				"status":        common.RedemptionCodeStatusUsed,
 				"used_user_id":  userId,
 			})
@@ -175,7 +176,10 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if result.RowsAffected == 0 {
 			return errors.New("该兑换码已被使用")
 		}
-		return creditUserQuotaWithinLimit(tx, userId, redemption.Quota, nil)
+		if err := creditUserQuotaWithinLimit(tx, userId, redemption.Quota, nil); err != nil {
+			return err
+		}
+		return recordAetherRedemptionEventTx(tx, redemption, userId, redeemedAt)
 	})
 	if err != nil {
 		common.SysError("redemption failed: " + err.Error())
@@ -183,6 +187,22 @@ func Redeem(key string, userId int) (quota int, err error) {
 	}
 	RecordLog(userId, LogTypeTopup, fmt.Sprintf("通过兑换码充值 %s，兑换码ID %d", logger.LogQuota(redemption.Quota), redemption.Id))
 	return redemption.Quota, nil
+}
+
+func recordAetherRedemptionEventTx(tx *gorm.DB, redemption *Redemption, userID int, occurredAt int64) error {
+	if redemption == nil || redemption.Id <= 0 || redemption.Quota <= 0 {
+		return errors.New("invalid redemption aether event input")
+	}
+	sourceID := strconv.Itoa(redemption.Id)
+	return RecordAetherFinancialEventTx(tx, AetherFinancialEventInput{
+		UserID:          userID,
+		SourceType:      "redemption",
+		SourceID:        sourceID,
+		DedupeKeyID:     "redemption:" + sourceID,
+		QuotaDelta:      redemption.Quota,
+		PaymentCategory: "redemption",
+		OccurredAt:      occurredAt,
+	})
 }
 
 func (redemption *Redemption) Insert() error {

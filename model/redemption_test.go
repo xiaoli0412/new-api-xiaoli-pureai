@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -102,10 +103,12 @@ func TestSearchRedemptionsFiltersAndPaginates(t *testing.T) {
 
 func setupRedeemFixture(t *testing.T, quota int) (userId int, key string) {
 	t.Helper()
-	require.NoError(t, DB.AutoMigrate(&Redemption{}))
+	require.NoError(t, DB.AutoMigrate(&Redemption{}, &AetherIntegration{}, &AetherLedgerEvent{}))
 	require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
 	t.Cleanup(func() {
 		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&Redemption{}).Error)
+		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&AetherLedgerEvent{}).Error)
+		require.NoError(t, DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Unscoped().Delete(&AetherIntegration{}).Error)
 		DB.Exec("DELETE FROM users")
 		DB.Exec("DELETE FROM logs")
 	})
@@ -178,4 +181,88 @@ func TestRedeemConcurrentSingleSuccess(t *testing.T) {
 	var user User
 	require.NoError(t, DB.First(&user, "id = ?", userId).Error)
 	assert.Equal(t, 300, user.Quota, "quota must be credited exactly once")
+}
+
+func openAetherRedeemDB(t *testing.T, name string, validIntegrationSecrets bool) *gorm.DB {
+	t.Helper()
+	previousDB := DB
+	db, err := gorm.Open(sqlite.Open("file:"+name+"?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&User{}, &Redemption{}, &AetherIntegration{}, &AetherLedgerEvent{}))
+	integration := &AetherIntegration{
+		ChannelID:      98,
+		InstanceID:     "aether-redemption",
+		ExecutionMode:  AetherExecutionModeDirectChannel,
+		Enabled:        true,
+		ConfigRevision: 1,
+	}
+	if validIntegrationSecrets {
+		require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+	} else {
+		integration.ControlSecretEncrypted = "invalid-secret"
+		integration.RelaySigningSecretEncrypted = "invalid-secret"
+	}
+	require.NoError(t, db.Create(integration).Error)
+	DB = db
+	t.Cleanup(func() {
+		DB = previousDB
+	})
+	return db
+}
+
+func TestRedeemWritesAetherFinancialEventInBusinessTransaction(t *testing.T) {
+	db := openAetherRedeemDB(t, "aether_redeem_outbox_success", true)
+	user := &User{Username: "redeem-aether-user", Password: "password", Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(user).Error)
+	redemption := &Redemption{
+		Name:        "redeem-aether-success",
+		Key:         "20000000000000000000000000000001",
+		Status:      common.RedemptionCodeStatusEnabled,
+		Quota:       700,
+		CreatedTime: common.GetTimestamp(),
+	}
+	require.NoError(t, db.Create(redemption).Error)
+
+	quota, err := Redeem(redemption.Key, user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, redemption.Quota, quota)
+
+	var event AetherLedgerEvent
+	require.NoError(t, db.Where("instance_id = ?", integrationInstanceIDForRedemptionTest()).First(&event).Error)
+	assert.Equal(t, AetherLedgerEventFinancial, event.EventType)
+	var payload aetherFinancialLedgerPayload
+	require.NoError(t, common.Unmarshal([]byte(event.Payload), &payload))
+	assert.Equal(t, "redemption", payload.SourceType)
+	assert.Equal(t, "700", payload.QuotaDelta)
+}
+
+func TestRedeemRollsBackWhenAetherFinancialOutboxWriteFails(t *testing.T) {
+	db := openAetherRedeemDB(t, "aether_redeem_outbox_failure", false)
+	user := &User{Username: "redeem-aether-rollback", Password: "password", Status: common.UserStatusEnabled}
+	require.NoError(t, db.Create(user).Error)
+	redemption := &Redemption{
+		Name:        "redeem-aether-failure",
+		Key:         "20000000000000000000000000000002",
+		Status:      common.RedemptionCodeStatusEnabled,
+		Quota:       900,
+		CreatedTime: common.GetTimestamp(),
+	}
+	require.NoError(t, db.Create(redemption).Error)
+
+	_, err := Redeem(redemption.Key, user.Id)
+	require.Error(t, err)
+
+	var refreshedUser User
+	require.NoError(t, db.First(&refreshedUser, user.Id).Error)
+	assert.Zero(t, refreshedUser.Quota)
+	var refreshedRedemption Redemption
+	require.NoError(t, db.First(&refreshedRedemption, redemption.Id).Error)
+	assert.Equal(t, common.RedemptionCodeStatusEnabled, refreshedRedemption.Status)
+	var eventCount int64
+	require.NoError(t, db.Model(&AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, eventCount)
+}
+
+func integrationInstanceIDForRedemptionTest() string {
+	return "aether-redemption"
 }

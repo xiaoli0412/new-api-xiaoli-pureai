@@ -77,40 +77,42 @@ func resolveUserSortOptions(sortOptions []UserSortOptions) UserSortOptions {
 // User if you add sensitive fields, don't forget to clean them in setupLogin function.
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
-	Id               int                        `json:"id"`
-	Username         string                     `json:"username" gorm:"unique;index" validate:"max=20"`
-	Password         string                     `json:"password" gorm:"not null;" validate:"min=8,max=20"`
-	OriginalPassword string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
-	DisplayName      string                     `json:"display_name" gorm:"index" validate:"max=20"`
-	Role             int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
-	Status           int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
-	Email            string                     `json:"email" gorm:"index" validate:"max=50"`
-	GitHubId         string                     `json:"github_id" gorm:"column:github_id;index"`
-	DiscordId        string                     `json:"discord_id" gorm:"column:discord_id;index"`
-	OidcId           string                     `json:"oidc_id" gorm:"column:oidc_id;index"`
-	WeChatId         string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
-	TelegramId       string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
-	VerificationCode string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
-	AccessToken      *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
-	Quota            int                        `json:"quota" gorm:"type:int;default:0"`
-	UsedQuota        int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
-	RequestCount     int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
-	Group            string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
-	AffCode          string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
-	AffCount         int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
-	AffQuota         int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
-	AffHistoryQuota  int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
-	InviterId        int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
-	DeletedAt        gorm.DeletedAt             `gorm:"index"`
-	LinuxDOId        string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
-	Setting          string                     `json:"setting" gorm:"type:text;column:setting"`
-	RequestRateLimit int                        `json:"request_rate_limit" gorm:"type:int;default:0;column:request_rate_limit"` // 用户级别 RPM 限制，0 表示使用全局默认值
-	ConcurrentLimit  int                        `json:"concurrent_limit" gorm:"type:int;default:0;column:concurrent_limit"`     // 用户级别并发请求限制，0 表示使用全局默认值
-	Remark           string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
-	StripeCustomer   string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
-	CreatedAt        int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
-	LastLoginAt      int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
-	AdminPermissions map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
+	Id                   int                        `json:"id"`
+	Username             string                     `json:"username" gorm:"unique;index" validate:"max=20"`
+	Password             string                     `json:"password" gorm:"not null;" validate:"min=8,max=20"`
+	OriginalPassword     string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
+	DisplayName          string                     `json:"display_name" gorm:"index" validate:"max=20"`
+	Role                 int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
+	Status               int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
+	Email                string                     `json:"email" gorm:"index" validate:"max=50"`
+	GitHubId             string                     `json:"github_id" gorm:"column:github_id;index"`
+	DiscordId            string                     `json:"discord_id" gorm:"column:discord_id;index"`
+	OidcId               string                     `json:"oidc_id" gorm:"column:oidc_id;index"`
+	WeChatId             string                     `json:"wechat_id" gorm:"column:wechat_id;index"`
+	TelegramId           string                     `json:"telegram_id" gorm:"column:telegram_id;index"`
+	VerificationCode     string                     `json:"verification_code" gorm:"-:all"`                         // this field is only for Email verification, don't save it to database!
+	AccessToken          *string                    `json:"-" gorm:"type:char(32);column:access_token;uniqueIndex"` // this token is for system management
+	Quota                int                        `json:"quota" gorm:"type:int;default:0"`
+	UsedQuota            int                        `json:"used_quota" gorm:"type:int;default:0;column:used_quota"` // used quota
+	RequestCount         int                        `json:"request_count" gorm:"type:int;default:0;"`               // request number
+	Group                string                     `json:"group" gorm:"type:varchar(64);default:'default'"`
+	AffCode              string                     `json:"aff_code" gorm:"type:varchar(32);column:aff_code;uniqueIndex"`
+	AffCount             int                        `json:"aff_count" gorm:"type:int;default:0;column:aff_count"`
+	AffQuota             int                        `json:"aff_quota" gorm:"type:int;default:0;column:aff_quota"`           // 邀请剩余额度
+	AffHistoryQuota      int                        `json:"aff_history_quota" gorm:"type:int;default:0;column:aff_history"` // 邀请历史额度
+	InviterId            int                        `json:"inviter_id" gorm:"type:int;column:inviter_id;index"`
+	DeletedAt            gorm.DeletedAt             `gorm:"index"`
+	LinuxDOId            string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
+	Setting              string                     `json:"setting" gorm:"type:text;column:setting"`
+	RequestRateLimit     int                        `json:"request_rate_limit" gorm:"type:int;default:0;column:request_rate_limit"` // 用户级别 RPM 限制，0 表示使用全局默认值
+	ConcurrentLimit      int                        `json:"concurrent_limit" gorm:"type:int;default:0;column:concurrent_limit"`     // 用户级别并发请求限制，0 表示使用全局默认值
+	Remark               string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
+	StripeCustomer       string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
+	CreatedAt            int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
+	LastLoginAt          int64                      `json:"last_login_at" gorm:"default:0;column:last_login_at"`
+	AdminPermissions     map[string]map[string]bool `json:"admin_permissions,omitempty" gorm:"-:all"`
+	inviteeRewardedQuota int
+	inviterRewardedQuota int
 }
 
 func (user *User) ToBaseUser() *UserBase {
@@ -489,15 +491,70 @@ func HardDeleteUserById(id int) error {
 	return user.HardDelete()
 }
 
-func inviteUser(inviterId int) (err error) {
-	user, err := GetUserById(inviterId, true)
-	if err != nil {
+const (
+	aetherFinancialSourceTypeInviteeReward         = "invitee_reward"
+	aetherFinancialSourceTypeInviterReferralReward = "inviter_referral_reward"
+)
+
+// applyInviteRewardsTx keeps registration rewards and their anonymous
+// financial outbox records in the caller's main-database transaction.
+func (user *User) applyInviteRewardsTx(tx *gorm.DB, inviterID int) error {
+	user.inviteeRewardedQuota = 0
+	user.inviterRewardedQuota = 0
+	if tx == nil || user == nil || user.Id <= 0 || inviterID <= 0 || !operation_setting.IsPaymentComplianceConfirmed() {
+		return nil
+	}
+
+	occurredAt := common.GetTimestamp()
+	inviteeSourceID := strconv.Itoa(user.Id)
+	if common.QuotaForInvitee > 0 {
+		if err := IncreaseUserQuotaTx(tx, user.Id, common.QuotaForInvitee); err != nil {
+			return err
+		}
+		if err := RecordAetherFinancialEventTx(tx, AetherFinancialEventInput{
+			UserID:          user.Id,
+			SourceType:      aetherFinancialSourceTypeInviteeReward,
+			SourceID:        inviteeSourceID,
+			DedupeKeyID:     "invitee:" + inviteeSourceID,
+			QuotaDelta:      common.QuotaForInvitee,
+			PaymentCategory: "invite",
+			OccurredAt:      occurredAt,
+		}); err != nil {
+			return err
+		}
+		user.Quota += common.QuotaForInvitee
+		user.inviteeRewardedQuota = common.QuotaForInvitee
+	}
+
+	if common.QuotaForInviter <= 0 {
+		return nil
+	}
+	result := tx.Model(&User{}).
+		Where("id = ?", inviterID).
+		Updates(map[string]interface{}{
+			"aff_count":   gorm.Expr("aff_count + ?", 1),
+			"aff_quota":   gorm.Expr("aff_quota + ?", common.QuotaForInviter),
+			"aff_history": gorm.Expr("aff_history + ?", common.QuotaForInviter),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("inviter not found")
+	}
+	if err := RecordAetherFinancialEventTx(tx, AetherFinancialEventInput{
+		UserID:          inviterID,
+		SourceType:      aetherFinancialSourceTypeInviterReferralReward,
+		SourceID:        inviteeSourceID,
+		DedupeKeyID:     "inviter:" + inviteeSourceID,
+		QuotaDelta:      common.QuotaForInviter,
+		PaymentCategory: "invite",
+		OccurredAt:      occurredAt,
+	}); err != nil {
 		return err
 	}
-	user.AffCount++
-	user.AffQuota += common.QuotaForInviter
-	user.AffHistoryQuota += common.QuotaForInviter
-	return DB.Save(user).Error
+	user.inviterRewardedQuota = common.QuotaForInviter
+	return nil
 }
 
 func (user *User) TransferAffQuotaToQuota(quota int) error {
@@ -604,7 +661,10 @@ func (user *User) Insert(inviterId int) error {
 				user.SetSetting(defaultSetting)
 			}
 
-			return tx.Create(user).Error
+			if err := tx.Create(user).Error; err != nil {
+				return err
+			}
+			return user.applyInviteRewardsTx(tx, inviterId)
 		})
 	}); err != nil {
 		return err
@@ -633,17 +693,7 @@ func (user *User) finishInsert(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(common.QuotaForInvitee)))
-		}
-		if common.QuotaForInviter > 0 {
-			//_ = IncreaseUserQuota(inviterId, common.QuotaForInviter)
-			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", logger.LogQuota(common.QuotaForInviter)))
-			_ = inviteUser(inviterId)
-		}
-	}
+	user.recordInviteRewardSideEffects(inviterId)
 }
 
 func (user *User) FinishInsert(inviterId int) {
@@ -652,7 +702,8 @@ func (user *User) FinishInsert(inviterId int) {
 
 // InsertWithTx inserts a new user within an existing transaction.
 // This is used for OAuth registration where user creation and binding need to be atomic.
-// Post-creation tasks (sidebar config, logs, inviter rewards) are handled after the transaction commits.
+// Post-creation tasks (sidebar config and logs) are handled after the
+// transaction commits. Invite rewards are part of this transaction.
 func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 	return withNormalizedEmailLock(tx, user.Email, func(tx *gorm.DB) error {
 		if err := user.prepareForInsert(tx); err != nil {
@@ -667,7 +718,10 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 			user.SetSetting(defaultSetting)
 		}
 
-		return tx.Create(user).Error
+		if err := tx.Create(user).Error; err != nil {
+			return err
+		}
+		return user.applyInviteRewardsTx(tx, inviterId)
 	})
 }
 
@@ -690,15 +744,21 @@ func (user *User) FinalizeOAuthUserCreation(inviterId int) {
 	if common.QuotaForNewUser > 0 {
 		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("新用户注册赠送 %s", logger.LogQuota(common.QuotaForNewUser)))
 	}
-	if inviterId != 0 && operation_setting.IsPaymentComplianceConfirmed() {
-		if common.QuotaForInvitee > 0 {
-			_ = IncreaseUserQuota(user.Id, common.QuotaForInvitee, true)
-			RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(common.QuotaForInvitee)))
-		}
-		if common.QuotaForInviter > 0 {
-			RecordLog(inviterId, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", logger.LogQuota(common.QuotaForInviter)))
-			_ = inviteUser(inviterId)
-		}
+	user.recordInviteRewardSideEffects(inviterId)
+}
+
+func (user *User) recordInviteRewardSideEffects(inviterID int) {
+	inviteeRewardedQuota := user.inviteeRewardedQuota
+	inviterRewardedQuota := user.inviterRewardedQuota
+	user.inviteeRewardedQuota = 0
+	user.inviterRewardedQuota = 0
+
+	if inviteeRewardedQuota > 0 {
+		IncreaseUserQuotaCache(user.Id, inviteeRewardedQuota)
+		RecordLog(user.Id, LogTypeSystem, fmt.Sprintf("使用邀请码赠送 %s", logger.LogQuota(inviteeRewardedQuota)))
+	}
+	if inviterRewardedQuota > 0 {
+		RecordLog(inviterID, LogTypeSystem, fmt.Sprintf("邀请用户赠送 %s", logger.LogQuota(inviterRewardedQuota)))
 	}
 }
 
@@ -1147,6 +1207,95 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 	}
 	IncreaseUserQuotaCache(id, quota)
 	return nil
+}
+
+const aetherFinancialSourceTypeAdminQuotaAdjustment = "admin_quota_adjustment"
+
+// UpdateUserQuotaByAdminWithMutationID applies an administrator quota mutation
+// and its AETHER financial outbox event in the same main-database transaction.
+// mutationID is deliberately opaque: it is HMACed before it reaches the outbox
+// dedupe key, so neither a user identity nor a caller-provided source ID leaks.
+func UpdateUserQuotaByAdminWithMutationID(id int, mode string, quota int, mutationID string) (oldQuota int, err error) {
+	if DB == nil {
+		return 0, errors.New("main database is required")
+	}
+	if id <= 0 {
+		return 0, errors.New("invalid user ID")
+	}
+
+	mode = strings.TrimSpace(mode)
+	mutationID = strings.TrimSpace(mutationID)
+	if mutationID == "" {
+		return 0, errors.New("admin quota mutation ID is required")
+	}
+	switch mode {
+	case "add", "subtract":
+		if quota <= 0 {
+			return 0, errors.New("quota must be greater than zero")
+		}
+	case "override":
+		// Preserve the existing admin API behavior, which permits an explicit
+		// override value without applying the add/subtract validation rules.
+	default:
+		return 0, errors.New("invalid admin quota mode")
+	}
+
+	quotaDelta := 0
+	occurredAt := common.GetTimestamp()
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		current := User{}
+		if err := lockForUpdate(tx).
+			Select("id", "quota").
+			Where("id = ?", id).
+			First(&current).Error; err != nil {
+			return err
+		}
+		oldQuota = current.Quota
+
+		switch mode {
+		case "add":
+			if err := IncreaseUserQuotaTx(tx, id, quota); err != nil {
+				return err
+			}
+			quotaDelta = quota
+		case "subtract":
+			// The legacy admin operation permits a quota balance below zero, so
+			// do not use the billing debit helper here.
+			if err := tx.Model(&User{}).
+				Where("id = ?", id).
+				Update("quota", gorm.Expr("quota - ?", quota)).Error; err != nil {
+				return err
+			}
+			quotaDelta = -quota
+		case "override":
+			if err := tx.Model(&User{}).Where("id = ?", id).Update("quota", quota).Error; err != nil {
+				return err
+			}
+			quotaDelta = quota - oldQuota
+		}
+
+		return RecordAetherFinancialEventTx(tx, AetherFinancialEventInput{
+			UserID:      id,
+			SourceType:  aetherFinancialSourceTypeAdminQuotaAdjustment,
+			SourceID:    "admin-quota",
+			DedupeKeyID: "admin-quota:" + mode + ":" + mutationID,
+			QuotaDelta:  quotaDelta,
+			OccurredAt:  occurredAt,
+		})
+	})
+	if err != nil {
+		return oldQuota, err
+	}
+
+	// Cache updates must happen only after the main transaction and outbox have
+	// committed; otherwise a failed outbox write could leave a stale cache.
+	switch mode {
+	case "add":
+		IncreaseUserQuotaCache(id, quota)
+	case "subtract":
+		DecreaseUserQuotaCache(id, quota)
+	}
+	return oldQuota, nil
 }
 
 func IncreaseUserQuotaTx(tx *gorm.DB, id int, quota int) error {

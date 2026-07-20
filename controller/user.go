@@ -1043,6 +1043,14 @@ type ManageRequest struct {
 	Mode   string `json:"mode"`
 }
 
+func adminQuotaMutationID(c *gin.Context) string {
+	mutationID := common.GetContextKeyString(c, common.RequestIdKey)
+	if mutationID == "" {
+		mutationID = common.NewRequestId()
+	}
+	return mutationID
+}
+
 // ManageUser Only admin user can do this
 func ManageUser(c *gin.Context) {
 	var req ManageRequest
@@ -1113,13 +1121,14 @@ func ManageUser(c *gin.Context) {
 		}
 		user.Role = common.RoleCommonUser
 	case "add_quota":
+		mutationID := adminQuotaMutationID(c)
 		switch req.Mode {
 		case "add":
 			if req.Value <= 0 {
 				common.ApiErrorI18n(c, i18n.MsgUserQuotaChangeZero)
 				return
 			}
-			if err := model.IncreaseUserQuota(user.Id, req.Value, true); err != nil {
+			if _, err := model.UpdateUserQuotaByAdminWithMutationID(user.Id, req.Mode, req.Value, mutationID); err != nil {
 				common.ApiError(c, err)
 				return
 			}
@@ -1131,7 +1140,7 @@ func ManageUser(c *gin.Context) {
 				common.ApiErrorI18n(c, i18n.MsgUserQuotaChangeZero)
 				return
 			}
-			if err := model.DecreaseUserQuota(user.Id, req.Value, true); err != nil {
+			if _, err := model.UpdateUserQuotaByAdminWithMutationID(user.Id, req.Mode, req.Value, mutationID); err != nil {
 				common.ApiError(c, err)
 				return
 			}
@@ -1139,8 +1148,8 @@ func ManageUser(c *gin.Context) {
 				"quota": logger.LogQuota(req.Value),
 			})
 		case "override":
-			oldQuota := user.Quota
-			if err := model.DB.Model(&model.User{}).Where("id = ?", user.Id).Update("quota", req.Value).Error; err != nil {
+			oldQuota, err := model.UpdateUserQuotaByAdminWithMutationID(user.Id, req.Mode, req.Value, mutationID)
+			if err != nil {
 				common.ApiError(c, err)
 				return
 			}

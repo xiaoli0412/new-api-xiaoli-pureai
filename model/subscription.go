@@ -1039,21 +1039,34 @@ func AdminDeleteUserSubscription(userSubscriptionId int) (string, error) {
 	return "", nil
 }
 
-func resetUserSubscriptionTx(tx *gorm.DB, sub *UserSubscription, plan *SubscriptionPlan, now int64, advanceResetTime bool) error {
+func resetUserSubscriptionTx(tx *gorm.DB, sub *UserSubscription, plan *SubscriptionPlan, now int64, advanceResetTime bool) (bool, error) {
 	if tx == nil || sub == nil || plan == nil {
-		return errors.New("invalid reset args")
+		return false, errors.New("invalid reset args")
 	}
+	changed := sub.AmountUsed != 0
 	sub.AmountUsed = 0
 	if advanceResetTime {
 		nextReset := calcNextResetTime(time.Unix(now, 0), plan, sub.EndTime)
-		sub.NextResetTime = nextReset
+		lastReset := int64(0)
 		if nextReset > 0 {
-			sub.LastResetTime = now
-		} else {
-			sub.LastResetTime = 0
+			lastReset = now
 		}
+		if sub.NextResetTime != nextReset || sub.LastResetTime != lastReset {
+			changed = true
+		}
+		sub.NextResetTime = nextReset
+		sub.LastResetTime = lastReset
 	}
-	return tx.Save(sub).Error
+	if !changed {
+		return false, nil
+	}
+	if err := tx.Save(sub).Error; err != nil {
+		return false, err
+	}
+	if err := recordAetherSubscriptionSnapshotTx(tx, sub, sub.Status, "reset", now); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func buildSubscriptionResetResult(plan *SubscriptionPlan, subs []UserSubscription, advanceResetTime bool) *SubscriptionResetResult {
@@ -1092,7 +1105,7 @@ func adminResetUserSubscriptionsByPlanTx(tx *gorm.DB, userId int, plan *Subscrip
 		return nil, errors.New("该用户没有有效的此套餐订阅")
 	}
 	for i := range subs {
-		if err := resetUserSubscriptionTx(tx, &subs[i], plan, now, advanceResetTime); err != nil {
+		if _, err := resetUserSubscriptionTx(tx, &subs[i], plan, now, advanceResetTime); err != nil {
 			return nil, err
 		}
 	}
@@ -1111,7 +1124,7 @@ func adminResetPlanSubscriptionsTx(tx *gorm.DB, plan *SubscriptionPlan, now int6
 		return nil, err
 	}
 	for i := range subs {
-		if err := resetUserSubscriptionTx(tx, &subs[i], plan, now, advanceResetTime); err != nil {
+		if _, err := resetUserSubscriptionTx(tx, &subs[i], plan, now, advanceResetTime); err != nil {
 			return nil, err
 		}
 	}
@@ -1310,15 +1323,15 @@ func (r *SubscriptionPreConsumeRecord) BeforeUpdate(tx *gorm.DB) error {
 	return nil
 }
 
-func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, plan *SubscriptionPlan, now int64) error {
+func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, plan *SubscriptionPlan, now int64) (bool, error) {
 	if tx == nil || sub == nil || plan == nil {
-		return errors.New("invalid reset args")
+		return false, errors.New("invalid reset args")
 	}
 	if sub.NextResetTime > 0 && sub.NextResetTime > now {
-		return nil
+		return false, nil
 	}
 	if NormalizeResetPeriod(plan.QuotaResetPeriod) == SubscriptionResetNever {
-		return nil
+		return false, nil
 	}
 	baseUnix := sub.LastResetTime
 	if baseUnix <= 0 {
@@ -1336,14 +1349,20 @@ func maybeResetUserSubscriptionWithPlanTx(tx *gorm.DB, sub *UserSubscription, pl
 		if sub.NextResetTime == 0 && next > 0 {
 			sub.NextResetTime = next
 			sub.LastResetTime = base.Unix()
-			return tx.Save(sub).Error
+			return false, tx.Save(sub).Error
 		}
-		return nil
+		return false, nil
 	}
 	sub.AmountUsed = 0
 	sub.LastResetTime = base.Unix()
 	sub.NextResetTime = next
-	return tx.Save(sub).Error
+	if err := tx.Save(sub).Error; err != nil {
+		return false, err
+	}
+	if err := recordAetherSubscriptionSnapshotTx(tx, sub, sub.Status, "reset", now); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // PreConsumeUserSubscription pre-consumes from any active subscription total quota.
@@ -1418,7 +1437,7 @@ func PreConsumeUserSubscriptionTx(tx *gorm.DB, requestId string, userId int, mod
 		if err != nil {
 			return nil, err
 		}
-		if err := maybeResetUserSubscriptionWithPlanTx(tx, &sub, plan, now); err != nil {
+		if _, err := maybeResetUserSubscriptionWithPlanTx(tx, &sub, plan, now); err != nil {
 			return nil, err
 		}
 		usedBefore := sub.AmountUsed
@@ -1527,10 +1546,13 @@ func ResetDueSubscriptions(limit int) (int, error) {
 				First(&locked).Error; err != nil {
 				return nil
 			}
-			if err := maybeResetUserSubscriptionWithPlanTx(tx, &locked, plan, now); err != nil {
+			resetApplied, err := maybeResetUserSubscriptionWithPlanTx(tx, &locked, plan, now)
+			if err != nil {
 				return err
 			}
-			resetCount++
+			if resetApplied {
+				resetCount++
+			}
 			return nil
 		})
 		if err != nil {
