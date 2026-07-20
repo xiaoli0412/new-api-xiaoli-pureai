@@ -461,25 +461,29 @@ func BatchInsertChannelsWithMutationID(channels []Channel, mutationID string) er
 }
 
 func BatchDeleteChannels(ids []int) error {
-	return BatchDeleteChannelsWithMutationID(ids, common.NewRequestId())
+	_, err := BatchDeleteChannelsWithMutationID(ids, common.NewRequestId())
+	return err
 }
 
-func BatchDeleteChannelsWithMutationID(ids []int, mutationID string) error {
+func BatchDeleteChannelsWithMutationID(ids []int, mutationID string) (int64, error) {
 	if len(ids) == 0 {
-		return nil
+		return 0, nil
 	}
 	if strings.TrimSpace(mutationID) == "" {
-		return errors.New("channel batch delete mutation ID is required")
+		return 0, errors.New("channel batch delete mutation ID is required")
 	}
-	return DB.Transaction(func(tx *gorm.DB) error {
+	var deletedCount int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
 		channels := make([]Channel, 0, len(ids))
 		if err := tx.Where("id in (?)", ids).Find(&channels).Error; err != nil {
 			return err
 		}
 		for _, chunk := range lo.Chunk(ids, 200) {
-			if err := tx.Where("id in (?)", chunk).Delete(&Channel{}).Error; err != nil {
-				return err
+			result := tx.Where("id in (?)", chunk).Delete(&Channel{})
+			if result.Error != nil {
+				return result.Error
 			}
+			deletedCount += result.RowsAffected
 			if err := tx.Where("channel_id in (?)", chunk).Delete(&Ability{}).Error; err != nil {
 				return err
 			}
@@ -492,6 +496,7 @@ func BatchDeleteChannelsWithMutationID(ids []int, mutationID string) error {
 		}
 		return nil
 	})
+	return deletedCount, err
 }
 
 func (channel *Channel) GetPriority() int64 {
@@ -1104,6 +1109,9 @@ func (channel *Channel) ValidateSettings() error {
 		if err != nil {
 			return err
 		}
+	}
+	if _, err := common.ParseProxyURLStrict(channelParams.Proxy); err != nil {
+		return fmt.Errorf("invalid channel proxy: %w", err)
 	}
 	channelOtherSettings := &dto.ChannelOtherSettings{}
 	if channel.OtherSettings != "" {

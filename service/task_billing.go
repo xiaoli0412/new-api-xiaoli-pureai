@@ -295,37 +295,46 @@ func refundTaskQuotaTx(ctx context.Context, task *model.Task, quota int, transit
 		if err != nil {
 			return err
 		}
-		if !claimed {
-			return nil
-		}
+		if claimed {
+			if taskIsSubscription(task) {
+				if err := model.PostConsumeUserSubscriptionDeltaTx(tx, task.PrivateData.SubscriptionId, -int64(quota)); err != nil {
+					return err
+				}
+			} else {
+				if err := model.IncreaseUserQuotaTx(tx, task.UserId, quota); err != nil {
+					return err
+				}
+				walletRefund = quota
+			}
 
-		if taskIsSubscription(task) {
-			if err := model.PostConsumeUserSubscriptionDeltaTx(tx, task.PrivateData.SubscriptionId, -int64(quota)); err != nil {
+			if task.PrivateData.TokenId > 0 {
+				if err := model.IncreaseTokenQuotaTx(tx, task.PrivateData.TokenId, quota); err != nil {
+					return err
+				}
+				tokenRefund = quota
+			}
+
+			if err := model.RecordAetherFinancialEventTx(tx, model.AetherFinancialEventInput{
+				UserID:          task.UserId,
+				SourceType:      "usage_refund",
+				SourceID:        claimKey,
+				DedupeKeyID:     claimKey,
+				QuotaDelta:      quota,
+				PaymentCategory: fundingSource,
+				OccurredAt:      common.GetTimestamp(),
+			}); err != nil {
 				return err
 			}
-		} else {
-			if err := model.IncreaseUserQuotaTx(tx, task.UserId, quota); err != nil {
-				return err
-			}
-			walletRefund = quota
 		}
 
-		if task.PrivateData.TokenId > 0 {
-			if err := model.IncreaseTokenQuotaTx(tx, task.PrivateData.TokenId, quota); err != nil {
+		if task.ID > 0 {
+			if err := tx.Model(&model.Task{}).
+				Where("id = ? AND quota = ?", task.ID, quota).
+				Update("quota", 0).Error; err != nil {
 				return err
 			}
-			tokenRefund = quota
 		}
-
-		return model.RecordAetherFinancialEventTx(tx, model.AetherFinancialEventInput{
-			UserID:          task.UserId,
-			SourceType:      "usage_refund",
-			SourceID:        claimKey,
-			DedupeKeyID:     claimKey,
-			QuotaDelta:      quota,
-			PaymentCategory: fundingSource,
-			OccurredAt:      common.GetTimestamp(),
-		})
+		return nil
 	})
 	if err != nil {
 		return false, false, err
@@ -374,27 +383,32 @@ func transitionTaskFailureWithRefund(ctx context.Context, task *model.Task, from
 	if refunded {
 		recordTaskRefundAuditLog(ctx, task, reason)
 	}
+	if transitioned {
+		task.Quota = 0
+	}
 	return transitioned, nil
 }
 
 // RefundTaskQuota 统一的任务失败退款逻辑。
 // 当异步任务失败时，将预扣的 quota 退还给用户（支持钱包和订阅），并退还令牌额度。
-func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) {
+// 返回资金来源是否已成功退还；失败时保留 quota 作为后续对账标记。
+func RefundTaskQuota(ctx context.Context, task *model.Task, reason string) bool {
 	quota := task.Quota
 	if quota == 0 {
-		return
+		return true
 	}
 
 	refunded, _, err := refundTaskQuotaTx(ctx, task, quota, nil)
 	if err != nil {
 		logger.LogWarn(ctx, fmt.Sprintf("退还任务额度失败 task %s: %s", task.TaskID, err.Error()))
-		return
-	}
-	if !refunded {
-		return
+		return false
 	}
 
-	recordTaskRefundAuditLog(ctx, task, reason)
+	if refunded {
+		recordTaskRefundAuditLog(ctx, task, reason)
+	}
+	task.Quota = 0
+	return true
 }
 
 type taskQuotaAdjustment struct {

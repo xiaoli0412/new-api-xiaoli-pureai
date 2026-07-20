@@ -1,6 +1,6 @@
 <div align="center">
 
-![new-api](/web/default/public/logo.png)
+![new-api](/web/public/logo.png)
 
 # New API
 
@@ -142,6 +142,16 @@ docker run --name new-api -d --restart always \
 > **💡 Tip:** `-v ./data:/data` will save data in the `data` folder of the current directory, you can also change it to an absolute path like `-v /your/custom/path:/data`
 
 </details>
+
+### 🔗 AETHER Relay Integration (Preview)
+
+- 🔌 Configure an AETHER channel from the channel editor with dedicated integration settings, capability/configuration/status synchronization, revision-conflict feedback, and controlled credential rotation.
+- 🔐 Relay forwarding attaches a short-lived HMAC-signed pseudonymous context containing only the instance, request, channel, group, model, and format metadata. It never includes user API keys, identity data, payment credentials, or balance details.
+- 🧾 New API remains the financial authority. Its transaction-aware, deduplicated anonymous financial outbox commits or rolls back with redemption, subscription, administrator quota adjustment, check-in award, and invitation-reward mutations; AETHER receives only anonymized, read-only usage, financial, subscription, channel, balance-observation, and pricing events.
+- 📊 AETHER can consume versioned pricing, event, and snapshot contracts with stable revisions and ETags. The integration cannot automatically write AETHER pricing back to New API.
+- 🛡️ Only `direct_channel` can send real traffic in this preview. `parallel_shadow` and `aether_decision` are intentionally rejected until their safety and capability gates are complete.
+- 📑 Operators can inspect the shared [aether-newapi/v1 contract](docs/contracts/aether-newapi-v1.json) before enabling an integration.
+- ⚠️ This is a prerelease integration. Focused checks do not replace validation against the full Docker, Redis, MySQL, and PostgreSQL service matrix. Before enabling production traffic, verify the matching contract, configuration revision, instance status, and credential rotation on a complete copy of the production database, including backup, migration, regression, and rollback; do not allow `AETHER_GATEWAY_AUTO_PREPARE_DATABASE` to migrate a production database before that validation succeeds.
 
 ---
 
@@ -306,8 +316,16 @@ docker run --name new-api -d --restart always \
 
 | Variable Name | Description | Default Value |
 |--------|------|--------|
-| `SESSION_SECRET` | Session secret (required for multi-machine deployment) | - |
-| `CRYPTO_SECRET` | Encryption secret (required for Redis) | - |
+| `SESSION_SECRET` | Authentication signing secret; must be identical on every node | - |
+| `SESSION_COOKIE_SECURE` | `false`/unset disables the refresh/logout OriginGuard for local HTTP dev proxies; `true` enables the Secure cookie and strict Origin checks | `false` |
+| `SESSION_COOKIE_TRUSTED_URL` | Required with Secure mode: comma-separated exact HTTPS Origins allowed to call refresh/logout; not a relay CORS allowlist | - |
+| `TRUSTED_PROXIES` | Unset/blank trusts loopback, RFC 1918 and IPv6 ULA with a startup warning; `none` trusts no proxies; an explicit proxy IP/CIDR list replaces the defaults | `127.0.0.0/8, ::1, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7` |
+| `USER_SESSION_ACTIVE_LIMIT` | Maximum active login Sessions per user | `50` |
+| `USER_SESSION_ISSUANCE_LIMIT` | Maximum Sessions created per user within the issuance window, including revoked Sessions | `100` |
+| `USER_SESSION_ISSUANCE_WINDOW_SECONDS` | Per-user Session issuance window; clamped to the revoked retention period when configured higher | `86400` |
+| `USER_SESSION_REVOKED_RETENTION_DAYS` | Days to retain revoked Session rows for audit and issuance accounting | `7` |
+| `USER_SESSION_HOURLY_ALERT_THRESHOLD` | Global Sessions created per hour that triggers an alert only; it never blocks login | `5000` |
+| `CRYPTO_SECRET` | HMAC secret for cache keys; nodes sharing Redis must use the same effective value | Defaults to `SESSION_SECRET` |
 | `SQL_DSN` | Database connection string | - |
 | `REDIS_CONN_STRING` | Redis connection string | - |
 | `STREAMING_TIMEOUT` | Streaming timeout (seconds) | `300` |
@@ -388,8 +406,20 @@ docker run --name new-api -d --restart always \
 ### ⚠️ Multi-machine Deployment Considerations
 
 > [!WARNING]
-> - **Must set** `SESSION_SECRET` - Otherwise login status inconsistent
-> - **Shared Redis must set** `CRYPTO_SECRET` - Otherwise data cannot be decrypted
+> - All nodes must use the same primary database and the same `SESSION_SECRET`; otherwise Access Tokens, refresh sessions, and temporary authentication flows cannot be verified consistently.
+> - Nodes connected to the same Redis must also use the same `CRYPTO_SECRET`, or their cache-key digests will differ and shared entries cannot be reused consistently.
+
+The database is authoritative for login Sessions and for the per-user active/issuance limits. Redis Session entries are short-lived caches whose TTL follows `SYNC_FREQUENCY` (60 seconds by default) and never exceeds the Session's remaining lifetime.
+
+| Redis topology | Session propagation | Rate limiting |
+| --- | --- | --- |
+| Shared Redis | Revocations and version publications normally propagate immediately | Redis limits are shared across nodes |
+| Independent Redis per node | Nodes converge from the database within the effective `SYNC_FREQUENCY`; a newly rotated token may receive a temporary 401 on a node with stale cache | Each node has its own allowance, so aggregate capacity can reach roughly the configured limit multiplied by the node count |
+| No Redis | Every Session validation reads the database | In-memory limits are independent per node |
+
+A shorter `SYNC_FREQUENCY` reduces the independent-Redis staleness window but causes one additional primary-key Session lookup per active SID, per node, per TTL. These guarantees make Session authentication bounded-stale across the supported topologies; rate limits and other Redis-backed control-plane caches remain topology-dependent.
+
+See [User authentication and login sessions](./docs/authentication.md) for the token, Origin-check and PAT contracts.
 
 ### 🔄 Channel Retry and Cache
 
