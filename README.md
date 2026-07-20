@@ -254,6 +254,15 @@ docker run --name new-api -d --restart always \
 
 </details>
 
+### 🔗 AETHER Relay Integration (Preview)
+
+- 🔌 Configure an AETHER channel from the channel editor with dedicated integration settings, capability/configuration/status synchronization, revision-conflict feedback, and controlled credential rotation.
+- 🔐 Relay forwarding attaches a short-lived HMAC-signed pseudonymous context containing only the instance, request, channel, group, model, and format metadata. It never includes user API keys, identity data, payment credentials, or balance details.
+- 🧾 New API remains the financial authority. A transaction-aware, deduplicated ledger outbox makes anonymized, read-only usage, financial, subscription, channel, balance-observation, and pricing events available to AETHER.
+- 📊 AETHER can consume versioned pricing, event, and snapshot contracts with stable revisions and ETags. The integration cannot automatically write AETHER pricing back to New API.
+- 🛡️ Only `direct_channel` can send real traffic in this preview. `parallel_shadow` and `aether_decision` are intentionally rejected until their safety and capability gates are complete.
+- 📑 Operators can inspect the shared [aether-newapi/v1 contract](docs/contracts/aether-newapi-v1.json) before enabling an integration.
+
 ---
 
 ## 🤖 Model Support
