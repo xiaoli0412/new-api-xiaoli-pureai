@@ -12,10 +12,12 @@ type RWMap[K comparable, V any] struct {
 }
 
 func (m *RWMap[K, V]) UnmarshalJSON(b []byte) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.data = make(map[K]V)
-	return common.Unmarshal(b, &m.data)
+	data := make(map[K]V)
+	if err := common.Unmarshal(b, &data); err != nil {
+		return err
+	}
+	m.Replace(data)
+	return nil
 }
 
 func (m *RWMap[K, V]) MarshalJSON() ([]byte, error) {
@@ -57,6 +59,20 @@ func (m *RWMap[K, V]) Clear() {
 	m.data = make(map[K]V)
 }
 
+// Replace atomically swaps all entries. Callers can parse and validate a new
+// map before replacing the active configuration, so malformed updates never
+// erase a working configuration.
+func (m *RWMap[K, V]) Replace(data map[K]V) {
+	copy := make(map[K]V, len(data))
+	for key, value := range data {
+		copy[key] = value
+	}
+
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.data = copy
+}
+
 // ReadAll returns a copy of the entire map.
 func (m *RWMap[K, V]) ReadAll() map[K]V {
 	m.mutex.RLock()
@@ -75,22 +91,25 @@ func (m *RWMap[K, V]) Len() int {
 }
 
 func LoadFromJsonString[K comparable, V any](m *RWMap[K, V], jsonStr string) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.data = make(map[K]V)
-	return common.Unmarshal([]byte(jsonStr), &m.data)
+	data := make(map[K]V)
+	if err := common.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return err
+	}
+	m.Replace(data)
+	return nil
 }
 
 // LoadFromJsonStringWithCallback loads a JSON string into the RWMap and calls the callback on success.
 func LoadFromJsonStringWithCallback[K comparable, V any](m *RWMap[K, V], jsonStr string, onSuccess func()) error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.data = make(map[K]V)
-	err := common.Unmarshal([]byte(jsonStr), &m.data)
-	if err == nil && onSuccess != nil {
+	data := make(map[K]V)
+	if err := common.Unmarshal([]byte(jsonStr), &data); err != nil {
+		return err
+	}
+	m.Replace(data)
+	if onSuccess != nil {
 		onSuccess()
 	}
-	return err
+	return nil
 }
 
 // MarshalJSONString returns the JSON string representation of the RWMap.

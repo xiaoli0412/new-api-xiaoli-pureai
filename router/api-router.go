@@ -53,6 +53,18 @@ func SetApiRouter(router *gin.Engine) {
 		// Standard OAuth providers (GitHub, Discord, OIDC, LinuxDO) - unified route
 		apiRouter.GET("/oauth/:provider", middleware.CriticalRateLimit(), controller.HandleOAuth)
 		apiRouter.GET("/ratio_config", middleware.CriticalRateLimit(), controller.GetRatioConfig)
+		relayPricingRoute := apiRouter.Group("/relay/pricing")
+		relayPricingRoute.Use(middleware.AdminAuth(), middleware.CriticalRateLimit())
+		{
+			relayPricingRoute.GET("/v1", controller.GetRelayPricingContractV1)
+		}
+		aetherSyncRoute := apiRouter.Group("/aether/v1")
+		aetherSyncRoute.Use(middleware.AetherServiceAuth(), middleware.CriticalRateLimit())
+		{
+			aetherSyncRoute.GET("/pricing", controller.GetRelayPricingContractV1)
+			aetherSyncRoute.GET("/events", controller.GetAetherEvents)
+			aetherSyncRoute.GET("/snapshot", controller.GetAetherSnapshot)
+		}
 
 		apiRouter.POST("/stripe/webhook", anonymousRequestBodyLimit, controller.StripeWebhook)
 		apiRouter.POST("/creem/webhook", anonymousRequestBodyLimit, controller.CreemWebhook)

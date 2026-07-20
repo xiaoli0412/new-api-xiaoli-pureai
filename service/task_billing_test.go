@@ -6,14 +6,20 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/types"
+	"github.com/alicebob/miniredis/v2"
+	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,6 +55,9 @@ func TestMain(m *testing.M) {
 		&model.UserSubscription{},
 		&model.SystemTask{},
 		&model.SystemTaskLock{},
+		&model.AetherIntegration{},
+		&model.AetherLedgerEvent{},
+		&model.BillingRefundClaim{},
 	); err != nil {
 		panic("failed to migrate: " + err.Error())
 	}
@@ -72,6 +81,9 @@ func truncate(t *testing.T) {
 		model.DB.Exec("DELETE FROM user_subscriptions")
 		model.DB.Exec("DELETE FROM system_task_locks")
 		model.DB.Exec("DELETE FROM system_tasks")
+		model.DB.Exec("DELETE FROM billing_refund_claims")
+		model.DB.Exec("DELETE FROM aether_ledger_events")
+		model.DB.Exec("DELETE FROM aether_integrations")
 	})
 }
 
@@ -115,6 +127,19 @@ func seedChannel(t *testing.T, id int) {
 	require.NoError(t, model.DB.Create(ch).Error)
 }
 
+func seedAetherIntegration(t *testing.T, channelID int, instanceID string) {
+	t.Helper()
+	integration := &model.AetherIntegration{
+		ChannelID:      channelID,
+		InstanceID:     instanceID,
+		ExecutionMode:  model.AetherExecutionModeDirectChannel,
+		Enabled:        true,
+		ConfigRevision: 1,
+	}
+	require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+	require.NoError(t, model.DB.Create(integration).Error)
+}
+
 func makeTask(userId, channelId, quota, tokenId int, billingSource string, subscriptionId int) *model.Task {
 	return &model.Task{
 		TaskID:    "task_" + time.Now().Format("150405.000"),
@@ -139,6 +164,194 @@ func makeTask(userId, channelId, quota, tokenId int, billingSource string, subsc
 				OriginModelName: "test-model",
 			},
 		},
+	}
+}
+
+func TestTaskTokenQuotaCacheSkipsEmptyResolvedKey(t *testing.T) {
+	truncate(t)
+
+	server, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(server.Close)
+
+	previousClient := common.RDB
+	previousRedisEnabled := common.RedisEnabled
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	common.RDB = client
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		_ = client.Close()
+		common.RDB = previousClient
+		common.RedisEnabled = previousRedisEnabled
+	})
+
+	const cachedQuota = 100
+	emptyKeyCache := "token:" + common.GenerateHMAC("")
+	resetEmptyKeyCache := func() {
+		require.NoError(t, client.HSet(context.Background(), emptyKeyCache, constant.TokenFiledRemainQuota, cachedQuota).Err())
+		require.NoError(t, client.Expire(context.Background(), emptyKeyCache, time.Minute).Err())
+	}
+	assertEmptyKeyCacheUnchanged := func() {
+		deadline := time.Now().Add(300 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			quota, err := client.HGet(context.Background(), emptyKeyCache, constant.TokenFiledRemainQuota).Int()
+			require.NoError(t, err)
+			require.Equal(t, cachedQuota, quota)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	ctx := context.Background()
+	missingTokenTask := makeTask(901, 0, 10, 9999, BillingSourceWallet, 0)
+	resetEmptyKeyCache()
+	updateTaskQuotaCaches(ctx, missingTokenTask, 10)
+	assertEmptyKeyCacheUnchanged()
+
+	resetEmptyKeyCache()
+	updateTaskQuotaCaches(ctx, missingTokenTask, -10)
+	assertEmptyKeyCacheUnchanged()
+}
+
+type tokenQuotaCacheUpdateHook struct {
+	tokenCacheKey         string
+	cacheSetCompleted     chan struct{}
+	quotaIncremented      chan struct{}
+	cacheSetCompletedOnce sync.Once
+	quotaIncrementedOnce  sync.Once
+}
+
+func (hook *tokenQuotaCacheUpdateHook) BeforeProcess(ctx context.Context, _ redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (hook *tokenQuotaCacheUpdateHook) AfterProcess(_ context.Context, _ redis.Cmder) error {
+	return nil
+}
+
+func (hook *tokenQuotaCacheUpdateHook) BeforeProcessPipeline(ctx context.Context, _ []redis.Cmder) (context.Context, error) {
+	return ctx, nil
+}
+
+func (hook *tokenQuotaCacheUpdateHook) AfterProcessPipeline(_ context.Context, cmds []redis.Cmder) error {
+	if redisPipelineIncludesKey(cmds, "hset", hook.tokenCacheKey) {
+		hook.cacheSetCompletedOnce.Do(func() {
+			close(hook.cacheSetCompleted)
+		})
+	}
+	if redisPipelineIncludesKey(cmds, "hincrby", hook.tokenCacheKey) {
+		hook.quotaIncrementedOnce.Do(func() {
+			close(hook.quotaIncremented)
+		})
+	}
+	return nil
+}
+
+func redisPipelineIncludesKey(cmds []redis.Cmder, command string, key string) bool {
+	for _, cmd := range cmds {
+		if cmd.Name() != command {
+			continue
+		}
+		args := cmd.Args()
+		if len(args) > 1 && args[1] == key {
+			return true
+		}
+	}
+	return false
+}
+
+func TestTaskQuotaCachesApplyOnlyCommittedTokenDelta(t *testing.T) {
+	truncate(t)
+	gopool.SetCap(1)
+	t.Cleanup(func() {
+		gopool.SetCap(1<<31 - 1)
+	})
+
+	server, err := miniredis.Run()
+	require.NoError(t, err)
+	t.Cleanup(server.Close)
+
+	previousClient := common.RDB
+	previousRedisEnabled := common.RedisEnabled
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		common.RDB = previousClient
+		common.RedisEnabled = previousRedisEnabled
+	})
+
+	const userID = 9100
+	seedUser(t, userID, 1000)
+
+	testCases := []struct {
+		name  string
+		delta int
+	}{
+		{name: "additional debit", delta: 10},
+		{name: "refund", delta: -10},
+	}
+
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+			common.RDB = client
+			t.Cleanup(func() {
+				require.NoError(t, client.Close())
+			})
+
+			tokenID := 9200 + index
+			tokenKey := "sk-task-cache-delta-" + testCase.name
+			seedToken(t, tokenID, userID, tokenKey, 100)
+			if testCase.delta > 0 {
+				require.NoError(t, model.DecreaseTokenQuotaTx(model.DB, tokenID, testCase.delta))
+			} else {
+				require.NoError(t, model.IncreaseTokenQuotaTx(model.DB, tokenID, -testCase.delta))
+			}
+
+			var committedToken model.Token
+			require.NoError(t, model.DB.Select("remain_quota").First(&committedToken, tokenID).Error)
+
+			tokenCacheKey := "token:" + common.GenerateHMAC(tokenKey)
+			require.NoError(t, client.HSet(ctx, tokenCacheKey, constant.TokenFiledRemainQuota, 100).Err())
+			require.NoError(t, client.Expire(ctx, tokenCacheKey, time.Minute).Err())
+
+			userCacheKey := "user:" + strconv.Itoa(userID)
+			require.NoError(t, client.HSet(ctx, userCacheKey, "Quota", 777).Err())
+			require.NoError(t, client.Expire(ctx, userCacheKey, time.Minute).Err())
+
+			hook := &tokenQuotaCacheUpdateHook{
+				tokenCacheKey:     tokenCacheKey,
+				cacheSetCompleted: make(chan struct{}),
+				quotaIncremented:  make(chan struct{}),
+			}
+			client.AddHook(hook)
+
+			task := makeTask(userID, 0, 0, tokenID, BillingSourceSubscription, 1)
+			updateTaskQuotaCaches(ctx, task, testCase.delta)
+
+			select {
+			case <-hook.quotaIncremented:
+			case <-time.After(3 * time.Second):
+				t.Fatal("timed out waiting for token quota cache update")
+			}
+
+			cachedQuota, err := client.HGet(ctx, tokenCacheKey, constant.TokenFiledRemainQuota).Int()
+			require.NoError(t, err)
+			assert.Equal(t, committedToken.RemainQuota, cachedQuota)
+
+			select {
+			case <-hook.cacheSetCompleted:
+				t.Error("token key lookup refreshed the full token cache")
+			default:
+			}
+
+			ttl, err := client.TTL(ctx, tokenCacheKey).Result()
+			require.NoError(t, err)
+			assert.Greater(t, ttl, time.Duration(0))
+
+			walletQuota, err := client.HGet(ctx, userCacheKey, "Quota").Result()
+			require.NoError(t, err)
+			assert.Equal(t, "777", walletQuota)
+		})
 	}
 }
 
@@ -392,6 +605,166 @@ func TestRefundTaskQuota_NoToken(t *testing.T) {
 	assert.Equal(t, model.LogTypeRefund, log.Type)
 }
 
+func TestRefundTaskQuotaWalletIsAtomicAndIdempotentWithAetherOutbox(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID, quota = 101, 101, 101, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-task-refund-wallet", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	seedChannel(t, channelID)
+	seedAetherIntegration(t, channelID, "aether-task-refund-wallet")
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+	require.NoError(t, model.DB.Create(task).Error)
+
+	RefundTaskQuota(ctx, task, "upstream failure")
+	RefundTaskQuota(ctx, task, "upstream failure")
+
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+	var event model.AetherLedgerEvent
+	require.NoError(t, model.DB.Where("event_type = ?", model.AetherLedgerEventFinancial).First(&event).Error)
+	assert.NotContains(t, event.DedupeKey, task.TaskID)
+	assert.Equal(t, int64(1), countLogs(t))
+}
+
+func TestRefundTaskQuotaConcurrentWalletPollsCreditOnlyOnce(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID, quota = 102, 102, 102, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-task-refund-wallet-concurrent", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	seedChannel(t, channelID)
+	seedAetherIntegration(t, channelID, "aether-task-refund-wallet-concurrent")
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+	require.NoError(t, model.DB.Create(task).Error)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			RefundTaskQuota(ctx, task, "upstream failure")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+}
+
+func TestRefundTaskQuotaSubscriptionReturnsQuotaOnlyOnce(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID, subscriptionID, quota = 103, 103, 103, 103, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-task-refund-subscription", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	seedChannel(t, channelID)
+	seedSubscription(t, subscriptionID, userID, 1000, 300)
+	seedAetherIntegration(t, channelID, "aether-task-refund-subscription")
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceSubscription, subscriptionID)
+	require.NoError(t, model.DB.Create(task).Error)
+
+	RefundTaskQuota(ctx, task, "upstream failure")
+	RefundTaskQuota(ctx, task, "upstream failure")
+
+	assert.Equal(t, int64(200), getSubscriptionUsed(t, subscriptionID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+}
+
+func TestRefundTaskQuotaRollsBackWhenAetherOutboxFails(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID, quota = 104, 104, 104, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-task-refund-outbox-failure", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	seedChannel(t, channelID)
+	require.NoError(t, model.DB.Create(&model.AetherIntegration{
+		ChannelID:                   channelID,
+		InstanceID:                  "aether-task-refund-outbox-failure",
+		ExecutionMode:               model.AetherExecutionModeDirectChannel,
+		Enabled:                     true,
+		ConfigRevision:              1,
+		ControlSecretEncrypted:      "invalid-secret",
+		RelaySigningSecretEncrypted: "invalid-secret",
+	}).Error)
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+	require.NoError(t, model.DB.Create(task).Error)
+
+	RefundTaskQuota(ctx, task, "upstream failure")
+
+	assert.Zero(t, getUserQuota(t, userID))
+	assert.Zero(t, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, quota, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, claimCount)
+	assert.Zero(t, eventCount)
+	assert.Zero(t, countLogs(t))
+}
+
+func TestRefundTaskQuotaKeepsMainFinancialCommitWhenAuxiliaryLogFails(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID, quota = 105, 105, 105, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-task-refund-log-failure", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	seedChannel(t, channelID)
+	seedAetherIntegration(t, channelID, "aether-task-refund-log-failure")
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+	require.NoError(t, model.DB.Create(task).Error)
+
+	previousLogDB := model.LOG_DB
+	logDB, err := gorm.Open(sqlite.Open("file:task_refund_auxiliary_log_failure?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	model.LOG_DB = logDB
+	t.Cleanup(func() {
+		model.LOG_DB = previousLogDB
+	})
+
+	RefundTaskQuota(ctx, task, "upstream failure")
+
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+}
+
 // ===========================================================================
 // RecalculateTaskQuota tests
 // ===========================================================================
@@ -462,6 +835,133 @@ func TestRecalculate_NegativeDelta(t *testing.T) {
 	assert.Equal(t, preConsumed-actualQuota, log.Quota)
 }
 
+func TestRecalculatePartialRefundRollsBackWhenAetherOutboxFails(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 111, 111, 111
+	const preConsumed, actualQuota = 500, 300
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-recalculate-outbox-failure", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", preConsumed).Error)
+	seedChannel(t, channelID)
+	require.NoError(t, model.DB.Create(&model.AetherIntegration{
+		ChannelID:                   channelID,
+		InstanceID:                  "aether-recalculate-outbox-failure",
+		ExecutionMode:               model.AetherExecutionModeDirectChannel,
+		Enabled:                     true,
+		ConfigRevision:              1,
+		ControlSecretEncrypted:      "invalid-secret",
+		RelaySigningSecretEncrypted: "invalid-secret",
+	}).Error)
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "recalculate-outbox-failure"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	err := RecalculateTaskQuota(ctx, task, actualQuota, "partial refund with broken outbox")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "aether integration secrets")
+
+	assert.Equal(t, 0, getUserQuota(t, userID))
+	assert.Equal(t, 0, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, preConsumed, getTokenUsedQuota(t, tokenID))
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.Equal(t, preConsumed, reloaded.Quota)
+	assert.Equal(t, preConsumed, task.Quota)
+	var eventCount int64
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, eventCount)
+	assert.Zero(t, countLogs(t))
+}
+
+func TestRecalculatePositiveDeltaRollsBackWhenAetherOutboxFailsThenPostsOnce(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 113, 113, 113
+	const preConsumed, actualQuota = 500, 700
+	seedUser(t, userID, 1_000)
+	seedToken(t, tokenID, userID, "sk-recalculate-positive-outbox", 1_000)
+	seedChannel(t, channelID)
+	integration := &model.AetherIntegration{
+		ChannelID:                   channelID,
+		InstanceID:                  "aether-recalculate-positive-outbox",
+		ExecutionMode:               model.AetherExecutionModeDirectChannel,
+		Enabled:                     true,
+		ConfigRevision:              1,
+		ControlSecretEncrypted:      "invalid-secret",
+		RelaySigningSecretEncrypted: "invalid-secret",
+	}
+	require.NoError(t, model.DB.Create(integration).Error)
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "recalculate-positive-outbox"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	err := RecalculateTaskQuota(ctx, task, actualQuota, "positive delta with broken outbox")
+	require.Error(t, err)
+	assert.Equal(t, 1_000, getUserQuota(t, userID))
+	assert.Equal(t, 1_000, getTokenRemainQuota(t, tokenID))
+	var failedTask model.Task
+	require.NoError(t, model.DB.First(&failedTask, task.ID).Error)
+	assert.Equal(t, preConsumed, failedTask.Quota)
+	assert.Equal(t, preConsumed, task.Quota)
+	var eventCount int64
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Zero(t, eventCount)
+	assert.Zero(t, countLogs(t))
+
+	require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+	require.NoError(t, model.DB.Save(integration).Error)
+	require.NoError(t, RecalculateTaskQuota(ctx, task, actualQuota, "positive delta with broken outbox"))
+	assert.Equal(t, 800, getUserQuota(t, userID))
+	assert.Equal(t, 800, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, actualQuota, task.Quota)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), eventCount)
+
+	var retryTask model.Task
+	require.NoError(t, model.DB.First(&retryTask, task.ID).Error)
+	require.NoError(t, RecalculateTaskQuota(ctx, &retryTask, actualQuota, "positive delta with broken outbox"))
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), eventCount)
+}
+
+func TestRecalculatePartialRefundUsesHMACDedupeWithoutTaskIDLeak(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 112, 112, 112
+	const preConsumed, actualQuota = 500, 300
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-recalculate-hmac-dedupe", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", preConsumed).Error)
+	seedChannel(t, channelID)
+	seedAetherIntegration(t, channelID, "aether-recalculate-hmac-dedupe")
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "raw-task-id-must-not-leak"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	require.NoError(t, RecalculateTaskQuota(ctx, task, actualQuota, "partial refund with private dedupe"))
+	assert.Equal(t, preConsumed-actualQuota, getUserQuota(t, userID))
+	assert.Equal(t, preConsumed-actualQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, actualQuota, getTokenUsedQuota(t, tokenID))
+	assert.Equal(t, actualQuota, task.Quota)
+
+	var event model.AetherLedgerEvent
+	require.NoError(t, model.DB.Where("event_type = ?", model.AetherLedgerEventFinancial).First(&event).Error)
+	assert.NotContains(t, event.DedupeKey, task.TaskID)
+	assert.Contains(t, event.DedupeKey, ":h_")
+
+	var retryTask model.Task
+	require.NoError(t, model.DB.First(&retryTask, task.ID).Error)
+	assert.Equal(t, actualQuota, retryTask.Quota)
+	require.NoError(t, RecalculateTaskQuota(ctx, &retryTask, actualQuota, "partial refund with private dedupe"))
+	var eventCount int64
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), eventCount)
+}
+
 func TestRecalculate_ZeroDelta(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
@@ -493,11 +993,14 @@ func TestRecalculate_ActualQuotaZero(t *testing.T) {
 
 	task := makeTask(userID, 0, 5000, 0, BillingSourceWallet, 0)
 
-	RecalculateTaskQuota(ctx, task, 0, "zero actual")
+	require.NoError(t, RecalculateTaskQuota(ctx, task, 0, "zero actual"))
 
-	// No change (early return)
-	assert.Equal(t, initQuota, getUserQuota(t, userID))
-	assert.Equal(t, int64(0), countLogs(t))
+	assert.Equal(t, initQuota+5000, getUserQuota(t, userID))
+	assert.Equal(t, 0, task.Quota)
+	log := getLastLog(t)
+	require.NotNil(t, log)
+	assert.Equal(t, model.LogTypeRefund, log.Type)
+	assert.Equal(t, 5000, log.Quota)
 }
 
 func TestRecalculate_Subscription_NegativeDelta(t *testing.T) {
@@ -781,6 +1284,27 @@ func TestSettle_PerCallBilling_SkipsTotalTokens(t *testing.T) {
 	settleTaskBillingOnComplete(ctx, adaptor, task, taskResult)
 
 	// Per-call: no recalculation by tokens
+	assert.Equal(t, initQuota, getUserQuota(t, userID))
+	assert.Equal(t, tokenRemain, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, preConsumed, task.Quota)
+	assert.Equal(t, int64(0), countLogs(t))
+}
+
+func TestSettle_PerCallBilling_RejectsKnownNegativeActualQuota(t *testing.T) {
+	truncate(t)
+	ctx := context.Background()
+
+	const userID, tokenID, channelID = 33, 33, 33
+	const initQuota, preConsumed, tokenRemain = 10000, 5000, 8000
+	seedUser(t, userID, initQuota)
+	seedToken(t, tokenID, userID, "sk-percall-negative", tokenRemain)
+	seedChannel(t, channelID)
+
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.PrivateData.BillingContext.PerCallBilling = true
+
+	err := settleTaskBillingOnComplete(ctx, successfulTaskPollingAdaptor{actualQuota: -1}, task, &relaycommon.TaskInfo{Status: model.TaskStatusSuccess})
+	require.ErrorContains(t, err, "task actual quota cannot be negative")
 	assert.Equal(t, initQuota, getUserQuota(t, userID))
 	assert.Equal(t, tokenRemain, getTokenRemainQuota(t, tokenID))
 	assert.Equal(t, preConsumed, task.Quota)

@@ -332,7 +332,11 @@ func UpdateOption(c *gin.Context) {
 			return
 		}
 	}
-	err = model.UpdateOption(option.Key, option.Value.(string))
+	mutationID := common.GetContextKeyString(c, common.RequestIdKey)
+	if mutationID == "" {
+		mutationID = common.NewRequestId()
+	}
+	err = model.UpdateOptionWithMutationID(option.Key, option.Value.(string), mutationID)
 	if err != nil {
 		common.ApiError(c, err)
 		return

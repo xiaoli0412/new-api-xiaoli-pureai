@@ -33,6 +33,8 @@ type AmountOptionsVisualEditorProps = {
   onChange: (value: string) => void
 }
 
+const maxAmountOption = 2_147_483_647
+
 export function AmountOptionsVisualEditor({
   value,
   onChange,
@@ -49,14 +51,23 @@ export function AmountOptionsVisualEditor({
     })
 
     return parsed
-      .filter((item) => typeof item === 'number' || !isNaN(Number(item)))
+      .filter(
+        (item) =>
+          Number.isSafeInteger(Number(item)) &&
+          Number(item) > 0 &&
+          Number(item) <= maxAmountOption
+      )
       .map(Number)
       .sort((a, b) => a - b)
   }, [value, t])
 
   const handleAdd = () => {
-    const amount = parseFloat(newAmount)
-    if (isNaN(amount) || amount <= 0) {
+    const amount = Number(newAmount)
+    if (
+      !Number.isSafeInteger(amount) ||
+      amount <= 0 ||
+      amount > maxAmountOption
+    ) {
       return
     }
 
@@ -141,8 +152,9 @@ export function AmountOptionsVisualEditor({
           <Input
             id='new-amount'
             type='number'
-            step='0.01'
-            min='0'
+            step='1'
+            min='1'
+            max={maxAmountOption}
             placeholder={t('e.g., 100')}
             value={newAmount}
             onChange={(e) => setNewAmount(e.target.value)}
@@ -156,7 +168,12 @@ export function AmountOptionsVisualEditor({
             e.stopPropagation()
             handleAdd()
           }}
-          disabled={!newAmount || parseFloat(newAmount) <= 0}
+          disabled={
+            !newAmount ||
+            !Number.isSafeInteger(Number(newAmount)) ||
+            Number(newAmount) <= 0 ||
+            Number(newAmount) > maxAmountOption
+          }
           className='w-full sm:w-auto'
         >
           <Plus className='h-4 w-4 sm:mr-2' />

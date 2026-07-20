@@ -209,12 +209,14 @@ func RequestWaffoPay(c *gin.Context) {
 	paymentRequestId := merchantOrderId
 
 	// Token 模式下归一化 Amount（存等价美元/CNY 数量，避免 RechargeWaffo 双重放大）
-	amount := req.Amount
-	if operation_setting.GetQuotaDisplayType() == operation_setting.QuotaDisplayTypeTokens {
-		amount = int64(float64(req.Amount) / common.QuotaPerUnit)
-		if amount < 1 {
-			amount = 1
-		}
+	amount, err := normalizeTopUpCreditAmount(req.Amount)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "error", "data": err.Error()})
+		return
+	}
+	if err := model.ValidateTopUpCredit(amount, payMoney, model.PaymentProviderWaffo); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "充值额度超出允许范围"})
+		return
 	}
 
 	// 创建本地订单

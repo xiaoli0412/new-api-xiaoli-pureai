@@ -99,6 +99,10 @@ func (*CreemAdaptor) RequestPay(c *gin.Context, req *CreemPayRequest) {
 
 	id := c.GetInt("id")
 	user, _ := model.GetUserById(id, false)
+	if err := model.ValidateTopUpCredit(selectedProduct.Quota, selectedProduct.Price, model.PaymentProviderCreem); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "error", "data": "产品充值额度超出允许范围"})
+		return
+	}
 
 	// 生成唯一的订单引用ID
 	reference := fmt.Sprintf("creem-api-ref-%d-%d-%s", user.Id, time.Now().UnixMilli(), randstr.String(4))

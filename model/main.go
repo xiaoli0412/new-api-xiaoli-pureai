@@ -299,6 +299,11 @@ func migrateDB() error {
 		&SystemTaskLock{},
 		&CasbinRule{},
 		&AuthzRole{},
+		&AetherIntegration{},
+		&AetherIntegrationPendingCredentialRotation{},
+		&AetherLedgerEvent{},
+		&BillingRefundClaim{},
+		&BillingRequestState{},
 	)
 	if err != nil {
 		return err
@@ -351,6 +356,11 @@ func migrateDBFast() error {
 		{&SystemInstance{}, "SystemInstance"},
 		{&SystemTask{}, "SystemTask"},
 		{&SystemTaskLock{}, "SystemTaskLock"},
+		{&AetherIntegration{}, "AetherIntegration"},
+		{&AetherIntegrationPendingCredentialRotation{}, "AetherIntegrationPendingCredentialRotation"},
+		{&AetherLedgerEvent{}, "AetherLedgerEvent"},
+		{&BillingRefundClaim{}, "BillingRefundClaim"},
+		{&BillingRequestState{}, "BillingRequestState"},
 	}
 	// 动态计算migration数量，确保errChan缓冲区足够大
 	errChan := make(chan error, len(migrations))

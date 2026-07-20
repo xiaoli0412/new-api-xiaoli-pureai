@@ -1,0 +1,5 @@
+{
+  "Maximum concurrent requests for this user. 0 = unlimited or use global default.": "Maximum concurrent requests for this user. 0 = unlimited or use global default.",
+  "Maximum successful requests per minute for this user. 0 = unlimited or use global default.": "Maximum successful requests per minute for this user. 0 = unlimited or use global default.",
+  "Set per-user request rate limits. 0 means using the global default.": "Set per-user request rate limits. 0 means using the global default."
+}

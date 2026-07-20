@@ -144,6 +144,16 @@ export const CHANNEL_TYPE_CONFIGS: Record<number, ChannelTypeConfig> = {
       models: 'Models exposed by this channel',
     },
   },
+  59: {
+    id: 59,
+    name: CHANNEL_TYPES[59],
+    icon: 'newapi',
+    hints: {
+      baseUrl: 'AETHER gateway base URL',
+      key: 'AETHER relay API key',
+      models: 'Models exposed by the selected AETHER route profile',
+    },
+  },
 }
 
 /**

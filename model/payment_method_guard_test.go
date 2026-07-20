@@ -102,6 +102,111 @@ func TestRechargeWaffoPancake_RejectsMismatchedPaymentMethod(t *testing.T) {
 	assert.Equal(t, 0, getUserQuotaForPaymentGuardTest(t, 101))
 }
 
+func TestTopUpFinalizationRejectsQuotaOverflow(t *testing.T) {
+	quotaPerUnit := int64(common.QuotaPerUnit)
+	require.Positive(t, quotaPerUnit)
+	overflowAmount := int64(common.MaxQuota)/quotaPerUnit + 1
+
+	testCases := []struct {
+		name     string
+		provider string
+		complete func(tradeNo string) error
+		topUp    func(tradeNo string) *TopUp
+	}{
+		{
+			name:     "stripe",
+			provider: PaymentProviderStripe,
+			complete: func(tradeNo string) error { return Recharge(tradeNo, "", "") },
+			topUp: func(tradeNo string) *TopUp {
+				return &TopUp{Amount: 1, Money: float64(overflowAmount), TradeNo: tradeNo}
+			},
+		},
+		{
+			name:     "epay manual completion",
+			provider: PaymentProviderEpay,
+			complete: func(tradeNo string) error { return ManualCompleteTopUp(tradeNo, "") },
+			topUp: func(tradeNo string) *TopUp {
+				return &TopUp{Amount: overflowAmount, Money: 1, TradeNo: tradeNo}
+			},
+		},
+		{
+			name:     "creem",
+			provider: PaymentProviderCreem,
+			complete: func(tradeNo string) error { return RechargeCreem(tradeNo, "", "", "") },
+			topUp: func(tradeNo string) *TopUp {
+				return &TopUp{Amount: int64(common.MaxQuota) + 1, Money: 1, TradeNo: tradeNo}
+			},
+		},
+		{
+			name:     "waffo",
+			provider: PaymentProviderWaffo,
+			complete: func(tradeNo string) error { return RechargeWaffo(tradeNo, "") },
+			topUp: func(tradeNo string) *TopUp {
+				return &TopUp{Amount: overflowAmount, Money: 1, TradeNo: tradeNo}
+			},
+		},
+		{
+			name:     "waffo pancake",
+			provider: PaymentProviderWaffoPancake,
+			complete: func(tradeNo string) error { return RechargeWaffoPancake(tradeNo) },
+			topUp: func(tradeNo string) *TopUp {
+				return &TopUp{Amount: overflowAmount, Money: 1, TradeNo: tradeNo}
+			},
+		},
+	}
+
+	for index, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			truncateTables(t)
+			userID := 500 + index
+			insertUserForPaymentGuardTest(t, userID, 0)
+
+			tradeNo := "topup-overflow-" + tc.name
+			topUp := tc.topUp(tradeNo)
+			topUp.UserId = userID
+			topUp.PaymentMethod = tc.provider
+			topUp.PaymentProvider = tc.provider
+			topUp.Status = common.TopUpStatusPending
+			topUp.CreateTime = time.Now().Unix()
+			require.NoError(t, topUp.Insert())
+
+			require.Error(t, tc.complete(tradeNo))
+			assert.Equal(t, common.TopUpStatusPending, getTopUpStatusForPaymentGuardTest(t, tradeNo))
+			assert.Zero(t, getUserQuotaForPaymentGuardTest(t, userID))
+		})
+	}
+}
+
+func TestRechargeWaffoPancakeRejectsUserQuotaOverflow(t *testing.T) {
+	truncateTables(t)
+
+	insertUserForPaymentGuardTest(t, 601, common.MaxQuota)
+	topUp := &TopUp{
+		UserId:          601,
+		Amount:          1,
+		Money:           1,
+		TradeNo:         "topup-user-overflow",
+		PaymentMethod:   PaymentMethodWaffoPancake,
+		PaymentProvider: PaymentProviderWaffoPancake,
+		Status:          common.TopUpStatusPending,
+		CreateTime:      time.Now().Unix(),
+	}
+	require.NoError(t, topUp.Insert())
+
+	require.Error(t, RechargeWaffoPancake(topUp.TradeNo))
+	assert.Equal(t, common.TopUpStatusPending, getTopUpStatusForPaymentGuardTest(t, topUp.TradeNo))
+	assert.Equal(t, common.MaxQuota, getUserQuotaForPaymentGuardTest(t, 601))
+}
+
+func TestIncreaseUserQuotaRejectsUserQuotaOverflow(t *testing.T) {
+	truncateTables(t)
+
+	insertUserForPaymentGuardTest(t, 602, common.MaxQuota)
+
+	require.Error(t, IncreaseUserQuota(602, 1, true))
+	assert.Equal(t, common.MaxQuota, getUserQuotaForPaymentGuardTest(t, 602))
+}
+
 func TestUpdatePendingTopUpStatus_RejectsMismatchedPaymentProvider(t *testing.T) {
 	testCases := []struct {
 		name                    string

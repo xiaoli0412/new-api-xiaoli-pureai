@@ -103,6 +103,38 @@ func createLog(log *Log) error {
 	return LOG_DB.Create(log).Error
 }
 
+func createConsumeLogWithAetherEvent(log *Log, writeAuxiliaryLog bool) error {
+	if log == nil {
+		return errors.New("consume log is required")
+	}
+	if DB == nil {
+		return errors.New("database is not initialized")
+	}
+	ensureLogRequestId(log)
+	if !writeAuxiliaryLog {
+		return DB.Transaction(func(tx *gorm.DB) error {
+			return RecordAetherUsageEventTx(tx, log)
+		})
+	}
+	if LOG_DB == DB {
+		return DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(log).Error; err != nil {
+				return err
+			}
+			return RecordAetherUsageEventTx(tx, log)
+		})
+	}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return RecordAetherUsageEventTx(tx, log)
+	}); err != nil {
+		return err
+	}
+	if LOG_DB == nil {
+		return nil
+	}
+	return LOG_DB.Create(log).Error
+}
+
 func clickHouseLogOrder(prefix string) string {
 	return prefix + "created_at desc, " + prefix + "request_id desc"
 }
@@ -340,10 +372,8 @@ type RecordConsumeLogParams struct {
 	Other            map[string]interface{} `json:"other"`
 }
 
-func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) {
-	if !common.LogConsumeEnabled {
-		return
-	}
+func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams) error {
+	writeAuxiliaryLog := common.LogConsumeEnabled
 	logger.LogInfo(c, fmt.Sprintf("record consume log: userId=%d, params=%s", userId, common.GetJsonString(params)))
 	username := c.GetString("username")
 	requestId := c.GetString(common.RequestIdKey)
@@ -383,11 +413,12 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		UpstreamRequestId: upstreamRequestId,
 		Other:             otherStr,
 	}
-	err := createLog(log)
+	err := createConsumeLogWithAetherEvent(log, writeAuxiliaryLog)
 	if err != nil {
 		logger.LogError(c, "failed to record log: "+err.Error())
+		return err
 	}
-	if common.DataExportEnabled {
+	if writeAuxiliaryLog && common.DataExportEnabled {
 		LogQuotaData(QuotaDataLogParams{
 			UserID:    userId,
 			Username:  username,
@@ -401,25 +432,52 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 			NodeName:  common.NodeName,
 		})
 	}
+	return nil
 }
 
 type RecordTaskBillingLogParams struct {
-	UserId    int
-	LogType   int
-	Content   string
-	ChannelId int
-	ModelName string
-	Quota     int
-	TokenId   int
-	Group     string
-	Other     map[string]interface{}
-	NodeName  string // 任务发起节点；为空时回退当前节点
+	UserId      int
+	LogType     int
+	SourceID    string
+	DedupeKeyID string
+	Content     string
+	ChannelId   int
+	ModelName   string
+	Quota       int
+	TokenId     int
+	Group       string
+	Other       map[string]interface{}
+	NodeName    string // 任务发起节点；为空时回退当前节点
 }
 
-func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
-	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
-		return
+func createTaskBillingLogWithAetherEvent(log *Log, financialEvent *AetherFinancialEventInput) error {
+	if financialEvent == nil {
+		return createLog(log)
 	}
+	if log == nil || DB == nil {
+		return errors.New("database is not initialized")
+	}
+	ensureLogRequestId(log)
+	if LOG_DB == DB {
+		return DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(log).Error; err != nil {
+				return err
+			}
+			return RecordAetherFinancialEventTx(tx, *financialEvent)
+		})
+	}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		return RecordAetherFinancialEventTx(tx, *financialEvent)
+	}); err != nil {
+		return err
+	}
+	if LOG_DB == nil {
+		return nil
+	}
+	return LOG_DB.Create(log).Error
+}
+
+func newTaskBillingLog(params RecordTaskBillingLogParams) *Log {
 	username, _ := GetUsernameById(params.UserId, false)
 	tokenName := ""
 	if params.TokenId > 0 {
@@ -427,11 +485,10 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 			tokenName = token.Name
 		}
 	}
-	createdAt := common.GetTimestamp()
-	log := &Log{
+	return &Log{
 		UserId:    params.UserId,
 		Username:  username,
-		CreatedAt: createdAt,
+		CreatedAt: common.GetTimestamp(),
 		Type:      params.LogType,
 		Content:   params.Content,
 		TokenName: tokenName,
@@ -442,9 +499,81 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		Group:     params.Group,
 		Other:     common.MapToJsonStr(params.Other),
 	}
-	err := createLog(log)
+}
+
+// RecordTaskBillingAuditLog writes task billing history to the auxiliary log
+// database only. It must not enqueue or otherwise mutate a financial event.
+func RecordTaskBillingAuditLog(params RecordTaskBillingLogParams) error {
+	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
+		return nil
+	}
+	if LOG_DB == nil {
+		return errors.New("log database is not initialized")
+	}
+	return createLog(newTaskBillingLog(params))
+}
+
+func taskBillingFinancialEvent(params RecordTaskBillingLogParams, occurredAt int64) (*AetherFinancialEventInput, error) {
+	if params.Quota <= 0 {
+		return nil, nil
+	}
+	if params.LogType != LogTypeConsume && params.LogType != LogTypeRefund {
+		return nil, nil
+	}
+	sourceID := strings.TrimSpace(params.SourceID)
+	if sourceID == "" {
+		return nil, errors.New("task billing source ID is required")
+	}
+	sourceType := "usage_refund"
+	paymentCategory := "usage_refund"
+	quotaDelta := params.Quota
+	if params.LogType == LogTypeConsume {
+		sourceType = "usage_charge"
+		paymentCategory = "usage_charge"
+		quotaDelta = -params.Quota
+	}
+	dedupeKeyID := strings.TrimSpace(params.DedupeKeyID)
+	if dedupeKeyID == "" {
+		dedupeKeyID = sourceID
+	}
+	return &AetherFinancialEventInput{
+		UserID:          params.UserId,
+		SourceType:      sourceType,
+		SourceID:        sourceID,
+		DedupeKeyID:     dedupeKeyID,
+		QuotaDelta:      quotaDelta,
+		PaymentCategory: paymentCategory,
+		OccurredAt:      occurredAt,
+	}, nil
+}
+
+// RecordTaskBillingFinancialEventTx writes only the financial outbox portion
+// of a task billing record into the caller's main-database transaction. The
+// auxiliary log database is deliberately not involved here.
+func RecordTaskBillingFinancialEventTx(tx *gorm.DB, params RecordTaskBillingLogParams) error {
+	if tx == nil {
+		return errors.New("task billing financial event transaction is required")
+	}
+	event, err := taskBillingFinancialEvent(params, common.GetTimestamp())
+	if err != nil || event == nil {
+		return err
+	}
+	return RecordAetherFinancialEventTx(tx, *event)
+}
+
+func RecordTaskBillingLog(params RecordTaskBillingLogParams) error {
+	if params.LogType == LogTypeConsume && !common.LogConsumeEnabled {
+		return nil
+	}
+	log := newTaskBillingLog(params)
+	financialEvent, err := taskBillingFinancialEvent(params, log.CreatedAt)
+	if err != nil {
+		return err
+	}
+	err = createTaskBillingLogWithAetherEvent(log, financialEvent)
 	if err != nil {
 		common.SysLog("failed to record task billing log: " + err.Error())
+		return err
 	}
 	if params.LogType == LogTypeConsume && common.DataExportEnabled {
 		nodeName := params.NodeName
@@ -453,16 +582,17 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 		}
 		LogQuotaData(QuotaDataLogParams{
 			UserID:    params.UserId,
-			Username:  username,
+			Username:  log.Username,
 			ModelName: params.ModelName,
 			Quota:     params.Quota,
-			CreatedAt: createdAt,
+			CreatedAt: log.CreatedAt,
 			UseGroup:  params.Group,
 			TokenID:   params.TokenId,
 			ChannelID: params.ChannelId,
 			NodeName:  nodeName,
 		})
 	}
+	return nil
 }
 
 func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int, group string, requestId string, upstreamRequestId string) (logs []*Log, total int64, err error) {

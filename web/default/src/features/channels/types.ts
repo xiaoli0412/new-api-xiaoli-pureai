@@ -197,6 +197,57 @@ export interface ChannelBalanceResponse {
   currency?: string
 }
 
+export interface AetherIntegration {
+  id: number
+  channel_id: number
+  instance_id: string
+  route_profile: string
+  execution_mode: 'direct_channel' | 'disabled'
+  enabled: boolean
+  capability_version: string
+  config_revision: number
+  remote_config_revision: number
+  has_control_secret: boolean
+  has_relay_signing_secret: boolean
+  has_transition_control_secret: boolean
+  has_transition_relay_signing_secret: boolean
+  transition_secrets_expire_at: number
+  last_sync_time: number
+  last_health_time: number
+  last_health_status: string
+}
+
+export interface AetherIntegrationUpdate {
+  base_revision?: number
+  rotation_id?: string
+  instance_id?: string
+  route_profile?: string
+  execution_mode?: 'direct_channel' | 'disabled'
+  enabled?: boolean
+  capability_version?: string
+  control_secret?: string
+  relay_signing_secret?: string
+  secret_transition_seconds?: number
+  revoke_transition_secrets?: boolean
+}
+
+export interface AetherIntegrationResponse {
+  success: boolean
+  message?: string
+  data?: AetherIntegration
+}
+
+export interface AetherIntegrationConflictPayload {
+  current_revision?: number
+  current?: Record<string, unknown>
+  current_config?: Record<string, unknown>
+  diff?: Record<string, unknown>
+}
+
+export interface AetherIntegrationMutationResponse extends AetherIntegrationResponse {
+  conflict?: AetherIntegrationConflictPayload
+}
+
 export interface FetchModelsResponse {
   success: boolean
   message?: string

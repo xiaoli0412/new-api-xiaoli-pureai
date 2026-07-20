@@ -259,6 +259,18 @@ func GetTokenById(id int) (*Token, error) {
 	return &token, err
 }
 
+// GetTokenKeyById loads a token key without refreshing its Redis cache.
+func GetTokenKeyById(id int) (string, error) {
+	if id == 0 {
+		return "", errors.New("id 为空！")
+	}
+	var token Token
+	if err := DB.Model(&Token{}).Select("key").Where("id = ?", id).First(&token).Error; err != nil {
+		return "", err
+	}
+	return token.Key, nil
+}
+
 func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 	defer func() {
 		// Update Redis cache asynchronously on successful DB read
@@ -383,19 +395,95 @@ func IncreaseTokenQuota(tokenId int, key string, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			err := cacheIncrTokenQuota(key, int64(quota))
-			if err != nil {
-				common.SysLog("failed to increase token quota: " + err.Error())
-			}
-		})
-	}
+	IncreaseTokenQuotaCache(key, quota)
 	if common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeTokenQuota, tokenId, quota)
 		return nil
 	}
 	return increaseTokenQuota(tokenId, quota)
+}
+
+func IncreaseTokenQuotaTx(tx *gorm.DB, tokenId int, quota int) error {
+	if tx == nil {
+		return errors.New("token quota transaction is required")
+	}
+	if tokenId <= 0 {
+		return errors.New("invalid token ID")
+	}
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if quota == 0 {
+		return nil
+	}
+	result := tx.Model(&Token{}).Where("id = ?", tokenId).Updates(
+		map[string]interface{}{
+			"remain_quota":  gorm.Expr("remain_quota + ?", quota),
+			"used_quota":    gorm.Expr("used_quota - ?", quota),
+			"accessed_time": common.GetTimestamp(),
+		},
+	)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("token does not exist")
+	}
+	return nil
+}
+
+func IncreaseTokenQuotaCache(key string, quota int) {
+	if quota <= 0 || !common.RedisEnabled {
+		return
+	}
+	gopool.Go(func() {
+		err := cacheIncrTokenQuota(key, int64(quota))
+		if err != nil {
+			common.SysLog("failed to increase token quota: " + err.Error())
+		}
+	})
+}
+
+// DecreaseTokenQuotaTx applies a billing debit directly to the main database.
+// It does not schedule a batch update or mutate Redis before commit.
+func DecreaseTokenQuotaTx(tx *gorm.DB, tokenId int, quota int) error {
+	if tx == nil {
+		return errors.New("token quota transaction is required")
+	}
+	if tokenId <= 0 {
+		return errors.New("invalid token ID")
+	}
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if quota == 0 {
+		return nil
+	}
+	result := tx.Model(&Token{}).
+		Where("id = ? AND remain_quota >= ?", tokenId, quota).
+		Updates(map[string]interface{}{
+			"remain_quota":  gorm.Expr("remain_quota - ?", quota),
+			"used_quota":    gorm.Expr("used_quota + ?", quota),
+			"accessed_time": common.GetTimestamp(),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("token quota is not enough")
+	}
+	return nil
+}
+
+func DecreaseTokenQuotaCache(key string, quota int) {
+	if quota <= 0 || !common.RedisEnabled {
+		return
+	}
+	gopool.Go(func() {
+		if err := cacheDecrTokenQuota(key, int64(quota)); err != nil {
+			common.SysLog("failed to decrease token quota: " + err.Error())
+		}
+	})
 }
 
 func increaseTokenQuota(id int, quota int) (err error) {
@@ -413,14 +501,7 @@ func DecreaseTokenQuota(id int, key string, quota int) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	if common.RedisEnabled {
-		gopool.Go(func() {
-			err := cacheDecrTokenQuota(key, int64(quota))
-			if err != nil {
-				common.SysLog("failed to decrease token quota: " + err.Error())
-			}
-		})
-	}
+	DecreaseTokenQuotaCache(key, quota)
 	if common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeTokenQuota, id, -quota)
 		return nil

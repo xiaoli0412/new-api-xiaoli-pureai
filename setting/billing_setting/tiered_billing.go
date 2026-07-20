@@ -5,6 +5,7 @@ import (
 
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/setting/config"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/samber/lo"
 )
 
@@ -36,23 +37,50 @@ func init() {
 // ---------------------------------------------------------------------------
 
 func GetBillingMode(model string) string {
-	if mode, ok := billingSetting.BillingMode[model]; ok {
-		return mode
-	}
-	return BillingModeRatio
+	mode := BillingModeRatio
+	ratio_setting.ReadPricingSettings(func() {
+		if configuredMode, ok := billingSetting.BillingMode[model]; ok {
+			mode = configuredMode
+		}
+	})
+	return mode
 }
 
 func GetBillingExpr(model string) (string, bool) {
-	expr, ok := billingSetting.BillingExpr[model]
+	var expr string
+	var ok bool
+	ratio_setting.ReadPricingSettings(func() {
+		expr, ok = billingSetting.BillingExpr[model]
+	})
 	return expr, ok
 }
 
 func GetBillingModeCopy() map[string]string {
-	return lo.Assign(billingSetting.BillingMode)
+	var modes map[string]string
+	ratio_setting.ReadPricingSettings(func() {
+		modes = lo.Assign(billingSetting.BillingMode)
+	})
+	return modes
 }
 
 func GetBillingExprCopy() map[string]string {
-	return lo.Assign(billingSetting.BillingExpr)
+	var expressions map[string]string
+	ratio_setting.ReadPricingSettings(func() {
+		expressions = lo.Assign(billingSetting.BillingExpr)
+	})
+	return expressions
+}
+
+func GetPricingSnapshot() ratio_setting.PricingSnapshot {
+	return ratio_setting.GetPricingSnapshot(func() (map[string]string, map[string]string) {
+		return lo.Assign(billingSetting.BillingMode), lo.Assign(billingSetting.BillingExpr)
+	})
+}
+
+func UpdatePricingSettings(values map[string]string) error {
+	return ratio_setting.UpdatePricingSettings(func() error {
+		return config.UpdateConfigFromMap(&billingSetting, values)
+	})
 }
 
 func GetPricingSyncData(base map[string]any) map[string]any {

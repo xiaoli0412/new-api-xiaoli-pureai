@@ -189,6 +189,7 @@ import {
   ChannelEditorLoadingState,
   ChannelModelsSection,
 } from './sections'
+import { AetherIntegrationSection } from './sections/aether-integration-section'
 
 type ChannelMutateDrawerProps = {
   open: boolean
@@ -646,6 +647,7 @@ export function ChannelMutateDrawer({
     useState(false)
   const [clipboardConnectionInfo, setClipboardConnectionInfo] =
     useState<ChannelConnectionInfo | null>(null)
+  const [aetherBusy, setAetherBusy] = useState(false)
 
   const isEditing = Boolean(currentRow)
   const channelId = currentRow?.id ?? null
@@ -1595,6 +1597,8 @@ export function ChannelMutateDrawer({
   // Submit handler
   const onSubmit = useCallback(
     async (data: ChannelFormValues) => {
+      if (aetherBusy) return
+
       // Validate key is required when creating
       if (!isEditing && !data.key?.trim()) {
         form.setError('key', {
@@ -1694,6 +1698,7 @@ export function ChannelMutateDrawer({
       await channelMutation.mutateAsync(data)
     },
     [
+      aetherBusy,
       isEditing,
       sensitiveLocked,
       form,
@@ -1815,8 +1820,10 @@ export function ChannelMutateDrawer({
   // Handle drawer close
   const handleOpenChange = useCallback(
     (v: boolean) => {
+      if (!v && (isSubmitting || aetherBusy)) return
       onOpenChange(v)
       if (!v) {
+        setAetherBusy(false)
         form.reset(CHANNEL_FORM_DEFAULT_VALUES)
         advancedNavScrollPendingRef.current = false
         setActiveEditorSectionId(CHANNEL_EDITOR_SECTION_IDS.identity)
@@ -1825,7 +1832,7 @@ export function ChannelMutateDrawer({
         setClipboardConnectionInfo(null)
       }
     },
-    [onOpenChange, form]
+    [aetherBusy, form, isSubmitting, onOpenChange]
   )
 
   return (
@@ -1942,7 +1949,7 @@ export function ChannelMutateDrawer({
                       <ChannelBasicSection>
                         <div className='grid gap-4 sm:grid-cols-2'>
                           <fieldset
-                            disabled={sensitiveLocked}
+                            disabled={sensitiveLocked || aetherBusy}
                             className='min-w-0 disabled:opacity-60'
                           >
                             <FormField
@@ -1963,6 +1970,7 @@ export function ChannelMutateDrawer({
                                         options={channelTypeOptions}
                                         value={String(field.value)}
                                         onValueChange={(value) => {
+                                          if (aetherBusy) return
                                           const nextType = Number(value)
                                           if (
                                             Number.isInteger(nextType) &&
@@ -2074,6 +2082,14 @@ export function ChannelMutateDrawer({
                         )}
                       </ChannelBasicSection>
                     </div>
+
+                    {isEditing && currentType === 59 && channelId && (
+                      <AetherIntegrationSection
+                        channelId={channelId}
+                        disabled={sensitiveLocked || isSubmitting}
+                        onBusyChange={setAetherBusy}
+                      />
+                    )}
 
                     {/* ── API Access ── */}
                     <div
@@ -4631,11 +4647,20 @@ export function ChannelMutateDrawer({
 
           <SheetFooter className={sideDrawerFooterClassName()}>
             <SheetClose
-              render={<Button variant='outline' disabled={isSubmitting} />}
+              render={
+                <Button
+                  variant='outline'
+                  disabled={isSubmitting || aetherBusy}
+                />
+              }
             >
               {t('Cancel')}
             </SheetClose>
-            <Button form='channel-form' type='submit' disabled={isSubmitting}>
+            <Button
+              form='channel-form'
+              type='submit'
+              disabled={isSubmitting || aetherBusy}
+            >
               {isSubmitting && (
                 <Loader2 className='mr-2 h-4 w-4 animate-spin' />
               )}

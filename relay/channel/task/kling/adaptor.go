@@ -2,6 +2,7 @@ package kling
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -101,9 +102,9 @@ type responsePayload struct {
 				WatermarkUrl string `json:"watermark_url"`
 			} `json:"images"`
 		} `json:"task_result"`
-		CreatedAt          int64  `json:"created_at"`
-		UpdatedAt          int64  `json:"updated_at"`
-		FinalUnitDeduction string `json:"final_unit_deduction"`
+		CreatedAt          int64           `json:"created_at"`
+		UpdatedAt          int64           `json:"updated_at"`
+		FinalUnitDeduction json.RawMessage `json:"final_unit_deduction"`
 	} `json:"data"`
 }
 
@@ -117,6 +118,8 @@ type TaskAdaptor struct {
 	apiKey      string
 	baseURL     string
 }
+
+var _ service.TaskCompletionActualQuotaProvider = (*TaskAdaptor)(nil)
 
 func (a *TaskAdaptor) Init(info *relaycommon.RelayInfo) {
 	a.ChannelType = info.ChannelType
@@ -357,9 +360,8 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 			video := videos[0]
 			taskInfo.Url = video.Url
 		}
-		if tokens, err := strconv.ParseFloat(resPayload.Data.FinalUnitDeduction, 64); err == nil {
-			// 上游返回的扣费数值，饱和转换防止超大数值回绕成负数
-			rounded := common.QuotaFromFloat(math.Ceil(tokens))
+		if rounded, known := parseFinalUnitDeduction(resPayload.Data.FinalUnitDeduction); known {
+			taskInfo.ActualQuota = &rounded
 			if rounded > 0 {
 				taskInfo.CompletionTokens = rounded
 				taskInfo.TotalTokens = rounded
@@ -371,6 +373,36 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		return nil, fmt.Errorf("unknown task status: %s", status)
 	}
 	return taskInfo, nil
+}
+
+func parseFinalUnitDeduction(raw json.RawMessage) (int, bool) {
+	var finalUnitDeduction *string
+	if err := json.Unmarshal(raw, &finalUnitDeduction); err != nil || finalUnitDeduction == nil {
+		return 0, false
+	}
+	value := strings.TrimSpace(*finalUnitDeduction)
+	if value == "" {
+		return 0, false
+	}
+	tokens, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(tokens) || math.IsInf(tokens, 0) {
+		return 0, false
+	}
+	// Finite upstream deductions use the shared saturation rule, including zero.
+	rounded := common.QuotaFromFloat(math.Ceil(tokens))
+	if tokens < 0 && rounded == 0 {
+		rounded = -1
+	}
+	return rounded, true
+}
+
+// ActualQuotaOnComplete distinguishes a supplied final_unit_deduction from a
+// missing or invalid one, which must retain the pre-consumed quota.
+func (*TaskAdaptor) ActualQuotaOnComplete(_ *model.Task, taskResult *relaycommon.TaskInfo) (actualQuota int, known bool) {
+	if taskResult == nil || taskResult.ActualQuota == nil {
+		return 0, false
+	}
+	return *taskResult.ActualQuota, true
 }
 
 func isNewAPIRelay(apiKey string) bool {

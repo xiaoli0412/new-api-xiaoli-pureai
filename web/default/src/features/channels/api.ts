@@ -21,6 +21,10 @@ import { api, type ApiRequestConfig } from '@/lib/api'
 
 import type {
   AddChannelRequest,
+  AetherIntegrationConflictPayload,
+  AetherIntegrationMutationResponse,
+  AetherIntegrationResponse,
+  AetherIntegrationUpdate,
   BatchDeleteParams,
   BatchSetTagParams,
   Channel,
@@ -102,6 +106,62 @@ export async function searchChannels(
  */
 export async function getChannel(id: number): Promise<GetChannelResponse> {
   const res = await api.get(`/api/channel/${id}`)
+  return res.data
+}
+
+export async function getAetherIntegration(
+  channelId: number
+): Promise<AetherIntegrationResponse> {
+  const res = await api.get(
+    `/api/channel/${channelId}/aether`,
+    channelActionConfig({
+      validateStatus: (status) =>
+        (status >= 200 && status < 300) || status === 404,
+    })
+  )
+  return res.data
+}
+
+export async function upsertAetherIntegration(
+  channelId: number,
+  data: AetherIntegrationUpdate
+): Promise<AetherIntegrationMutationResponse> {
+  const res = await api.put(
+    `/api/channel/${channelId}/aether`,
+    data,
+    channelActionConfig({
+      validateStatus: (status) =>
+        (status >= 200 && status < 300) || status === 409,
+    })
+  )
+  if (res.status === 409) {
+    const body = res.data as {
+      message?: string
+      data?: AetherIntegrationConflictPayload
+    }
+    return { success: false, message: body.message, conflict: body.data }
+  }
+  return res.data
+}
+
+export async function syncAetherIntegration(
+  channelId: number
+): Promise<AetherIntegrationMutationResponse> {
+  const res = await api.post(
+    `/api/channel/${channelId}/aether/sync`,
+    undefined,
+    channelActionConfig({
+      validateStatus: (status) =>
+        (status >= 200 && status < 300) || status === 409,
+    })
+  )
+  if (res.status === 409) {
+    const body = res.data as {
+      message?: string
+      data?: AetherIntegrationConflictPayload
+    }
+    return { success: false, message: body.message, conflict: body.data }
+  }
   return res.data
 }
 

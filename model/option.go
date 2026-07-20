@@ -1,12 +1,16 @@
 package model
 
 import (
+	"errors"
+	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/billing_setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/setting/performance_setting"
@@ -18,6 +22,72 @@ import (
 type Option struct {
 	Key   string `json:"key" gorm:"primaryKey"`
 	Value string `json:"value"`
+}
+
+func validateBillingOption(key string, value string) error {
+	switch key {
+	case "Price", "USDExchangeRate", "QuotaPerUnit", "StripeUnitPrice", "WaffoUnitPrice", "WaffoPancakeUnitPrice", "general_setting.custom_currency_exchange_rate":
+		amount, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || math.IsNaN(amount) || math.IsInf(amount, 0) || amount <= 0 {
+			return fmt.Errorf("%s must be a finite value greater than 0", key)
+		}
+	case "claude.thinking_adapter_budget_tokens_percentage", "gemini.thinking_adapter_budget_tokens_percentage":
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || math.IsNaN(ratio) || math.IsInf(ratio, 0) || ratio <= 0 || ratio > 1 {
+			return fmt.Errorf("%s must be a finite value greater than 0 and not greater than 1", key)
+		}
+	case "grok.violation_deduction_amount":
+		amount, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil || math.IsNaN(amount) || math.IsInf(amount, 0) || amount <= 0 {
+			return fmt.Errorf("%s must be a finite value greater than 0", key)
+		}
+	case "payment_setting.amount_options":
+		var amounts []int64
+		if err := common.UnmarshalJsonStr(value, &amounts); err != nil || amounts == nil {
+			return fmt.Errorf("payment amount options must be a JSON array of positive integers")
+		}
+		seen := make(map[int64]struct{}, len(amounts))
+		for _, amount := range amounts {
+			if amount <= 0 || amount > int64(common.MaxQuota) {
+				return fmt.Errorf("payment amount option must be between 1 and %d", common.MaxQuota)
+			}
+			if _, exists := seen[amount]; exists {
+				return fmt.Errorf("payment amount options must not contain duplicates")
+			}
+			seen[amount] = struct{}{}
+		}
+	case "payment_setting.amount_discount":
+		var discounts map[string]float64
+		if err := common.UnmarshalJsonStr(value, &discounts); err != nil || discounts == nil {
+			return fmt.Errorf("payment amount discounts must be a JSON object")
+		}
+		for amount, rate := range discounts {
+			parsedAmount, err := strconv.ParseInt(amount, 10, 64)
+			if err != nil || parsedAmount <= 0 || parsedAmount > int64(common.MaxQuota) {
+				return fmt.Errorf("payment amount discount key %q must be a positive integer", amount)
+			}
+			if math.IsNaN(rate) || math.IsInf(rate, 0) || rate <= 0 || rate > 1 {
+				return fmt.Errorf("payment amount discount for %q must be finite and between 0 and 1", amount)
+			}
+		}
+	case "tool_price_setting.prices":
+		var prices map[string]float64
+		if err := common.UnmarshalJsonStr(value, &prices); err != nil || prices == nil {
+			return fmt.Errorf("tool prices must be a JSON object")
+		}
+		for name, price := range prices {
+			if strings.TrimSpace(name) == "" || math.IsNaN(price) || math.IsInf(price, 0) || price < 0 {
+				return fmt.Errorf("tool price for %q must be finite and not less than 0", name)
+			}
+		}
+	case "ModelRatio", "ModelPrice", "CacheRatio", "CreateCacheRatio", "CompletionRatio", "ImageRatio", "AudioRatio", "AudioCompletionRatio", "GroupRatio":
+		return ratio_setting.ValidateNonNegativeRatioMapJSON(value)
+	case "GroupGroupRatio":
+		return ratio_setting.ValidateNonNegativeGroupRatioMapJSON(value)
+	case "TopupGroupRatio":
+		return common.ValidateTopupGroupRatioJSON(value)
+	}
+	return nil
 }
 
 func AllOption() ([]*Option, error) {
@@ -207,19 +277,38 @@ func SyncOptions(frequency int) {
 }
 
 func UpdateOption(key string, value string) error {
-	// Save to database first
-	option := Option{
-		Key: key,
+	return UpdateOptionWithMutationID(key, value, common.NewRequestId())
+}
+
+func UpdateOptionWithMutationID(key string, value string, mutationID string) error {
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("pricing mutation ID is required")
 	}
-	// https://gorm.io/docs/update.html#Save-All-Fields
-	DB.FirstOrCreate(&option, Option{Key: key})
-	option.Value = value
-	// Save is a combination function.
-	// If save value does not contain primary key, it will execute Create,
-	// otherwise it will execute Update (with all fields).
-	DB.Save(&option)
+	if err := validateBillingOption(key, value); err != nil {
+		return err
+	}
+	occurredAt := common.GetTimestamp()
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		option := Option{Key: key}
+		if err := tx.FirstOrCreate(&option, Option{Key: key}).Error; err != nil {
+			return err
+		}
+		option.Value = value
+		if err := tx.Save(&option).Error; err != nil {
+			return err
+		}
+		if shouldRecordAetherPricingOption(key) {
+			return RecordAetherPricingEventTxWithMutationID(tx, key, occurredAt, mutationID)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 	// Update OptionMap
-	return updateOptionMap(key, value)
+	if err := updateOptionMap(key, value); err != nil {
+		return err
+	}
+	return nil
 }
 
 // UpdateOptionsBulk persists multiple key/value pairs in a single database
@@ -228,9 +317,22 @@ func UpdateOption(key string, value string) error {
 // is touched — safe for callers that must commit a set of related options
 // atomically (e.g. payment gateway binding).
 func UpdateOptionsBulk(values map[string]string) error {
+	return UpdateOptionsBulkWithMutationID(values, common.NewRequestId())
+}
+
+func UpdateOptionsBulkWithMutationID(values map[string]string, mutationID string) error {
 	if len(values) == 0 {
 		return nil
 	}
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("pricing mutation ID is required")
+	}
+	for key, value := range values {
+		if err := validateBillingOption(key, value); err != nil {
+			return err
+		}
+	}
+	occurredAt := common.GetTimestamp()
 	err := DB.Transaction(func(tx *gorm.DB) error {
 		for k, v := range values {
 			option := Option{Key: k}
@@ -240,6 +342,11 @@ func UpdateOptionsBulk(values map[string]string) error {
 			option.Value = v
 			if err := tx.Save(&option).Error; err != nil {
 				return err
+			}
+			if shouldRecordAetherPricingOption(k) {
+				if err := RecordAetherPricingEventTxWithMutationID(tx, k, occurredAt, mutationID); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -256,6 +363,9 @@ func UpdateOptionsBulk(values map[string]string) error {
 }
 
 func updateOptionMap(key string, value string) (err error) {
+	if err := validateBillingOption(key, value); err != nil {
+		return err
+	}
 	common.OptionMapRWMutex.Lock()
 	defer common.OptionMapRWMutex.Unlock()
 	common.OptionMap[key] = value
@@ -561,7 +671,11 @@ func updateOptionMap(key string, value string) (err error) {
 	case "ChannelDisableThreshold":
 		common.ChannelDisableThreshold, _ = strconv.ParseFloat(value, 64)
 	case "QuotaPerUnit":
-		common.QuotaPerUnit, _ = strconv.ParseFloat(value, 64)
+		quotaPerUnit, parseErr := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if parseErr != nil {
+			return parseErr
+		}
+		ratio_setting.UpdateQuotaPerUnit(quotaPerUnit)
 	case "SensitiveWords":
 		setting.SensitiveWordsFromString(value)
 	case "AutomaticDisableKeywords":
@@ -602,7 +716,11 @@ func handleConfigUpdate(key, value string) bool {
 	configMap := map[string]string{
 		configKey: value,
 	}
-	config.UpdateConfigFromMap(cfg, configMap)
+	if configName == "billing_setting" {
+		_ = billing_setting.UpdatePricingSettings(configMap)
+	} else {
+		_ = config.UpdateConfigFromMap(cfg, configMap)
+	}
 
 	// 特定配置的后处理
 	if configName == "performance_setting" {

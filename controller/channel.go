@@ -681,7 +681,7 @@ func AddChannel(c *gin.Context) {
 		}
 		channels = append(channels, *localChannel)
 	}
-	err = model.BatchInsertChannels(channels)
+	err = model.BatchInsertChannelsWithMutationID(channels, channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -706,7 +706,7 @@ func DeleteChannel(c *gin.Context) {
 		channelName = existing.Name
 	}
 	channel := model.Channel{Id: id}
-	err := channel.Delete()
+	err := channel.DeleteWithMutationID(channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -723,8 +723,16 @@ func DeleteChannel(c *gin.Context) {
 	return
 }
 
+func channelMutationID(c *gin.Context) string {
+	mutationID := common.GetContextKeyString(c, common.RequestIdKey)
+	if mutationID == "" {
+		mutationID = common.NewRequestId()
+	}
+	return mutationID
+}
+
 func DeleteDisabledChannel(c *gin.Context) {
-	rows, err := model.DeleteDisabledChannel()
+	rows, err := model.DeleteDisabledChannelWithMutationID(channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -763,7 +771,7 @@ func DisableTagChannels(c *gin.Context) {
 		})
 		return
 	}
-	err = model.DisableChannelByTag(channelTag.Tag)
+	err = model.DisableChannelByTagWithMutationID(channelTag.Tag, channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -789,7 +797,7 @@ func EnableTagChannels(c *gin.Context) {
 		})
 		return
 	}
-	err = model.EnableChannelByTag(channelTag.Tag)
+	err = model.EnableChannelByTagWithMutationID(channelTag.Tag, channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -849,7 +857,7 @@ func EditTagChannels(c *gin.Context) {
 		}
 		channelTag.HeaderOverride = common.GetPointer[string](trimmed)
 	}
-	err = model.EditChannelByTag(channelTag.Tag, channelTag.NewTag, channelTag.ModelMapping, channelTag.Models, channelTag.Groups, channelTag.Priority, channelTag.Weight, channelTag.ParamOverride, channelTag.HeaderOverride)
+	err = model.EditChannelByTagWithMutationID(channelTag.Tag, channelTag.NewTag, channelTag.ModelMapping, channelTag.Models, channelTag.Groups, channelTag.Priority, channelTag.Weight, channelTag.ParamOverride, channelTag.HeaderOverride, channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -880,7 +888,7 @@ func DeleteChannelBatch(c *gin.Context) {
 		})
 		return
 	}
-	err = model.BatchDeleteChannels(channelBatch.Ids)
+	err = model.BatchDeleteChannelsWithMutationID(channelBatch.Ids, channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1046,7 +1054,7 @@ func UpdateChannel(c *gin.Context) {
 			// 覆盖模式：直接使用新密钥（默认行为，不需要特殊处理）
 		}
 	}
-	err = channel.Update()
+	err = channel.UpdateWithMutationID(channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1096,7 +1104,11 @@ func UpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	changed := model.UpdateChannelStatus(id, "", req.Status, "manual operation")
+	changed, err := model.UpdateChannelStatusWithMutationID(id, "", req.Status, "manual operation", channelMutationID(c))
+	if err != nil {
+		common.ApiError(c, err)
+		return
+	}
 	if changed {
 		model.InitChannelCache()
 		service.ResetProxyClientCache()
@@ -1119,11 +1131,10 @@ func BatchUpdateChannelStatus(c *gin.Context) {
 		common.ApiErrorI18n(c, i18n.MsgInvalidParams)
 		return
 	}
-	changedCount := 0
-	for _, id := range req.Ids {
-		if model.UpdateChannelStatus(id, "", req.Status, "manual batch operation") {
-			changedCount++
-		}
+	changedCount, err := model.UpdateChannelStatusesWithMutationID(req.Ids, req.Status, "manual batch operation", channelMutationID(c))
+	if err != nil {
+		common.ApiError(c, err)
+		return
 	}
 	if changedCount > 0 {
 		model.InitChannelCache()
@@ -1286,7 +1297,7 @@ func BatchSetChannelTag(c *gin.Context) {
 		})
 		return
 	}
-	err = model.BatchSetChannelTag(channelBatch.Ids, channelBatch.Tag)
+	err = model.BatchSetChannelTagWithMutationID(channelBatch.Ids, channelBatch.Tag, channelMutationID(c))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -1386,7 +1397,7 @@ func CopyChannel(c *gin.Context) {
 	}
 
 	// insert
-	if err := clone.Insert(); err != nil {
+	if err := clone.InsertWithMutationID(channelMutationID(c)); err != nil {
 		common.SysError("failed to clone channel: " + err.Error())
 		c.JSON(http.StatusOK, gin.H{"success": false, "message": "复制渠道失败，请稍后重试"})
 		return
@@ -1622,7 +1633,7 @@ func ManageMultiKeys(c *gin.Context) {
 
 		channel.ChannelInfo.MultiKeyStatusList[keyIndex] = 2 // disabled
 
-		err = channel.Update()
+		err = channel.UpdateWithMutationID(channelMutationID(c))
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1664,7 +1675,7 @@ func ManageMultiKeys(c *gin.Context) {
 			delete(channel.ChannelInfo.MultiKeyDisabledReason, keyIndex)
 		}
 
-		err = channel.Update()
+		err = channel.UpdateWithMutationID(channelMutationID(c))
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1688,7 +1699,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
 		channel.ChannelInfo.MultiKeyDisabledReason = make(map[int]string)
 
-		err = channel.Update()
+		err = channel.UpdateWithMutationID(channelMutationID(c))
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1735,7 +1746,7 @@ func ManageMultiKeys(c *gin.Context) {
 			return
 		}
 
-		err = channel.Update()
+		err = channel.UpdateWithMutationID(channelMutationID(c))
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1815,7 +1826,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
 
-		err = channel.Update()
+		err = channel.UpdateWithMutationID(channelMutationID(c))
 		if err != nil {
 			common.ApiError(c, err)
 			return
@@ -1883,7 +1894,7 @@ func ManageMultiKeys(c *gin.Context) {
 		channel.ChannelInfo.MultiKeyDisabledTime = newDisabledTime
 		channel.ChannelInfo.MultiKeyDisabledReason = newDisabledReason
 
-		err = channel.Update()
+		err = channel.UpdateWithMutationID(channelMutationID(c))
 		if err != nil {
 			common.ApiError(c, err)
 			return

@@ -16,12 +16,12 @@ all: build-all-web start-api
 
 build-web:
 	@echo "Building default web..."
-	@cd ./web && bun install --frozen-lockfile
+	@cd ./web && bun install --filter ./default --frozen-lockfile --linker hoisted
 	@cd $(WEB_DIR) && DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
 
 build-web-classic:
 	@echo "Building classic web..."
-	@cd ./web && bun install --frozen-lockfile
+	@cd ./web && bun install --filter ./classic --frozen-lockfile --linker isolated
 	@cd $(WEB_CLASSIC_DIR) && VITE_REACT_APP_VERSION=$(cat ../../VERSION) bun run build
 
 build-all-web: build-web build-web-classic
@@ -41,12 +41,12 @@ dev-api-rebuild:
 dev-web:
 	@echo "Starting default web dev server..."
 	@echo "Default web: http://localhost:$(DEV_WEB_DEFAULT_PORT)"
-	@cd ./web && bun install --filter ./default
+	@cd ./web && bun install --filter ./default --linker hoisted
 	@cd $(WEB_DIR) && bun run dev -- --host 0.0.0.0 --port $(DEV_WEB_DEFAULT_PORT)
 
 dev-web-classic:
 	@echo "Starting classic web dev server..."
-	@cd ./web && bun install --filter ./classic
+	@cd ./web && bun install --filter ./classic --linker isolated
 	@cd $(WEB_CLASSIC_DIR) && bun run dev -- --host 0.0.0.0 --port $(DEV_WEB_CLASSIC_PORT)
 
 dev: dev-api dev-web

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -13,10 +14,12 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/logger"
+	"github.com/QuantumNous/new-api/model"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/setting"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func CovertMjpActionToModelName(mjAction string) string {
@@ -25,6 +28,97 @@ func CovertMjpActionToModelName(mjAction string) string {
 		modelName = "swap_face"
 	}
 	return modelName
+}
+
+func midjourneyRefundReference(task *model.Midjourney) string {
+	identity := fmt.Sprintf("midjourney:%d", task.Id)
+	if task.Id <= 0 {
+		identity = fmt.Sprintf("fallback:user:%d:channel:%d:task:%s", task.UserId, task.ChannelId, task.MjId)
+	}
+	return fmt.Sprintf("midjourney-refund:v1:%x", common.Sha256Raw([]byte(identity)))
+}
+
+// TransitionMidjourneyFailureWithRefund moves a Midjourney task into its
+// terminal failure state, returns its reservation, and writes the authoritative
+// financial outbox event in one main-database transaction.
+func TransitionMidjourneyFailureWithRefund(ctx context.Context, task *model.Midjourney, fromStatus string, reason string) (bool, error) {
+	if task == nil || task.Id <= 0 {
+		return false, fmt.Errorf("midjourney task is required for failure transition")
+	}
+	if model.DB == nil {
+		return false, fmt.Errorf("midjourney failure database is not initialized")
+	}
+
+	claimKey := midjourneyRefundReference(task)
+	transitioned := false
+	refunded := false
+	err := model.DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.Midjourney{}).
+			Where("id = ? AND status = ?", task.Id, fromStatus).
+			Select("*").
+			Updates(task)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		transitioned = true
+		if task.Quota == 0 {
+			return nil
+		}
+
+		claimed, err := model.ClaimBillingRefundTx(tx, claimKey)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return nil
+		}
+		if err := model.IncreaseUserQuotaTx(tx, task.UserId, task.Quota); err != nil {
+			return err
+		}
+		if err := model.RecordAetherFinancialEventTx(tx, model.AetherFinancialEventInput{
+			UserID:          task.UserId,
+			SourceType:      "usage_refund",
+			SourceID:        claimKey,
+			DedupeKeyID:     claimKey,
+			QuotaDelta:      task.Quota,
+			PaymentCategory: "wallet",
+			OccurredAt:      common.GetTimestamp(),
+		}); err != nil {
+			return err
+		}
+		refunded = true
+		return nil
+	})
+	if err != nil {
+		return false, fmt.Errorf("transition midjourney task %d with refund: %w", task.Id, err)
+	}
+	if !transitioned {
+		return false, nil
+	}
+	if !refunded {
+		return true, nil
+	}
+
+	model.IncreaseUserQuotaCache(task.UserId, task.Quota)
+	if err := model.RecordTaskBillingAuditLog(model.RecordTaskBillingLogParams{
+		UserId:    task.UserId,
+		LogType:   model.LogTypeRefund,
+		SourceID:  claimKey,
+		Content:   "",
+		ChannelId: task.ChannelId,
+		ModelName: CovertMjpActionToModelName(task.Action),
+		Quota:     task.Quota,
+		Other: map[string]interface{}{
+			"task_id": task.MjId,
+			"reason":  reason,
+		},
+	}); err != nil {
+		logger.LogWarn(ctx, fmt.Sprintf("记录 Midjourney 退款审计日志失败 task %s: %s", task.MjId, err.Error()))
+	}
+	return true, nil
 }
 
 func GetMjRequestModel(relayMode int, midjRequest *dto.MidjourneyRequest) (string, *dto.MidjourneyResponse, bool) {

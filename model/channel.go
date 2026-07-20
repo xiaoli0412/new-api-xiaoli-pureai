@@ -424,54 +424,74 @@ func GetChannelById(id int, selectAll bool) (*Channel, error) {
 }
 
 func BatchInsertChannels(channels []Channel) error {
+	return BatchInsertChannelsWithMutationID(channels, common.NewRequestId())
+}
+
+func BatchInsertChannelsWithMutationID(channels []Channel, mutationID string) error {
 	if len(channels) == 0 {
 		return nil
 	}
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return tx.Error
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("channel batch insert mutation ID is required")
 	}
-	defer func() {
-		if r := recover(); r != nil {
-			tx.Rollback()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		for start := 0; start < len(channels); start += 50 {
+			end := start + 50
+			if end > len(channels) {
+				end = len(channels)
+			}
+			chunk := channels[start:end]
+			if err := tx.Create(&chunk).Error; err != nil {
+				return err
+			}
+			for index := range chunk {
+				if err := chunk[index].AddAbilities(tx); err != nil {
+					return err
+				}
+			}
 		}
-	}()
-
-	for _, chunk := range lo.Chunk(channels, 50) {
-		if err := tx.Create(&chunk).Error; err != nil {
-			tx.Rollback()
-			return err
-		}
-		for _, channel_ := range chunk {
-			if err := channel_.AddAbilities(tx); err != nil {
-				tx.Rollback()
+		now := common.GetTimestamp()
+		for index := range channels {
+			if err := RecordAetherChannelEventTxWithMutationID(tx, &channels[index], "created", now, mutationID); err != nil {
 				return err
 			}
 		}
-	}
-	return tx.Commit().Error
+		return nil
+	})
 }
 
 func BatchDeleteChannels(ids []int) error {
+	return BatchDeleteChannelsWithMutationID(ids, common.NewRequestId())
+}
+
+func BatchDeleteChannelsWithMutationID(ids []int, mutationID string) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	// 使用事务 分批删除channel表和abilities表
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return tx.Error
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("channel batch delete mutation ID is required")
 	}
-	for _, chunk := range lo.Chunk(ids, 200) {
-		if err := tx.Where("id in (?)", chunk).Delete(&Channel{}).Error; err != nil {
-			tx.Rollback()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		channels := make([]Channel, 0, len(ids))
+		if err := tx.Where("id in (?)", ids).Find(&channels).Error; err != nil {
 			return err
 		}
-		if err := tx.Where("channel_id in (?)", chunk).Delete(&Ability{}).Error; err != nil {
-			tx.Rollback()
-			return err
+		for _, chunk := range lo.Chunk(ids, 200) {
+			if err := tx.Where("id in (?)", chunk).Delete(&Channel{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("channel_id in (?)", chunk).Delete(&Ability{}).Error; err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit().Error
+		now := common.GetTimestamp()
+		for index := range channels {
+			if err := RecordAetherChannelEventTxWithMutationID(tx, &channels[index], "deleted", now, mutationID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (channel *Channel) GetPriority() int64 {
@@ -514,62 +534,83 @@ func (channel *Channel) GetStatusCodeMapping() string {
 }
 
 func (channel *Channel) Insert() error {
-	var err error
-	err = DB.Create(channel).Error
-	if err != nil {
-		return err
+	return channel.InsertWithMutationID(common.NewRequestId())
+}
+
+func (channel *Channel) InsertWithMutationID(mutationID string) error {
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("channel insert mutation ID is required")
 	}
-	err = channel.AddAbilities(nil)
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(channel).Error; err != nil {
+			return err
+		}
+		if err := channel.AddAbilities(tx); err != nil {
+			return err
+		}
+		return RecordAetherChannelEventTxWithMutationID(tx, channel, "created", common.GetTimestamp(), mutationID)
+	})
 }
 
 func (channel *Channel) Update() error {
-	// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
-	if channel.ChannelInfo.IsMultiKey {
-		var keyStr string
-		if channel.Key != "" {
-			keyStr = channel.Key
-		} else {
-			// If key is not provided, read the existing key from the database
-			if existing, err := GetChannelById(channel.Id, true); err == nil {
+	return channel.UpdateWithMutationID(common.NewRequestId())
+}
+
+func (channel *Channel) UpdateWithMutationID(mutationID string) error {
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("channel update mutation ID is required")
+	}
+	return DB.Transaction(func(tx *gorm.DB) error {
+		// If this is a multi-key channel, recalculate MultiKeySize based on the current key list to avoid inconsistency after editing keys
+		if channel.ChannelInfo.IsMultiKey {
+			var keyStr string
+			if channel.Key != "" {
+				keyStr = channel.Key
+			} else {
+				var existing Channel
+				if err := tx.Select("key").Where("id = ?", channel.Id).First(&existing).Error; err != nil {
+					return err
+				}
 				keyStr = existing.Key
 			}
-		}
-		// Parse the key list (supports newline separation or JSON array)
-		keys := []string{}
-		if keyStr != "" {
-			trimmed := strings.TrimSpace(keyStr)
-			if strings.HasPrefix(trimmed, "[") {
-				var arr []json.RawMessage
-				if err := common.Unmarshal([]byte(trimmed), &arr); err == nil {
-					keys = make([]string, len(arr))
-					for i, v := range arr {
-						keys[i] = string(v)
+			// Parse the key list (supports newline separation or JSON array)
+			keys := []string{}
+			if keyStr != "" {
+				trimmed := strings.TrimSpace(keyStr)
+				if strings.HasPrefix(trimmed, "[") {
+					var arr []json.RawMessage
+					if err := common.Unmarshal([]byte(trimmed), &arr); err == nil {
+						keys = make([]string, len(arr))
+						for i, v := range arr {
+							keys[i] = string(v)
+						}
+					}
+				}
+				if len(keys) == 0 { // fallback to newline split
+					keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
+				}
+			}
+			channel.ChannelInfo.MultiKeySize = len(keys)
+			// Clean up status data that exceeds the new key count to prevent index out of range
+			if channel.ChannelInfo.MultiKeyStatusList != nil {
+				for idx := range channel.ChannelInfo.MultiKeyStatusList {
+					if idx >= channel.ChannelInfo.MultiKeySize {
+						delete(channel.ChannelInfo.MultiKeyStatusList, idx)
 					}
 				}
 			}
-			if len(keys) == 0 { // fallback to newline split
-				keys = strings.Split(strings.Trim(keyStr, "\n"), "\n")
-			}
 		}
-		channel.ChannelInfo.MultiKeySize = len(keys)
-		// Clean up status data that exceeds the new key count to prevent index out of range
-		if channel.ChannelInfo.MultiKeyStatusList != nil {
-			for idx := range channel.ChannelInfo.MultiKeyStatusList {
-				if idx >= channel.ChannelInfo.MultiKeySize {
-					delete(channel.ChannelInfo.MultiKeyStatusList, idx)
-				}
-			}
+		if err := tx.Model(channel).Updates(channel).Error; err != nil {
+			return err
 		}
-	}
-	var err error
-	err = DB.Model(channel).Updates(channel).Error
-	if err != nil {
-		return err
-	}
-	DB.Model(channel).First(channel, "id = ?", channel.Id)
-	err = channel.UpdateAbilities(nil)
-	return err
+		if err := tx.First(channel, "id = ?", channel.Id).Error; err != nil {
+			return err
+		}
+		if err := channel.UpdateAbilities(tx); err != nil {
+			return err
+		}
+		return RecordAetherChannelEventTxWithMutationID(tx, channel, "updated", common.GetTimestamp(), mutationID)
+	})
 }
 
 func (channel *Channel) UpdateResponseTime(responseTime int64) {
@@ -582,24 +623,43 @@ func (channel *Channel) UpdateResponseTime(responseTime int64) {
 	}
 }
 
-func (channel *Channel) UpdateBalance(balance float64) {
-	err := DB.Model(channel).Select("balance_updated_time", "balance").Updates(Channel{
-		BalanceUpdatedTime: common.GetTimestamp(),
-		Balance:            balance,
-	}).Error
-	if err != nil {
-		common.SysLog(fmt.Sprintf("failed to update balance: channel_id=%d, error=%v", channel.Id, err))
+func (channel *Channel) UpdateBalance(balance float64) error {
+	return channel.UpdateBalanceWithMutationID(balance, common.NewRequestId())
+}
+
+func (channel *Channel) UpdateBalanceWithMutationID(balance float64, mutationID string) error {
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("channel balance mutation ID is required")
 	}
+	observedAt := common.GetTimestamp()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(channel).Select("balance_updated_time", "balance").Updates(Channel{
+			BalanceUpdatedTime: observedAt,
+			Balance:            balance,
+		}).Error; err != nil {
+			return err
+		}
+		return RecordAetherChannelBalanceObservationTxWithMutationID(tx, channel.Id, balance, observedAt, mutationID)
+	})
 }
 
 func (channel *Channel) Delete() error {
-	var err error
-	err = DB.Delete(channel).Error
-	if err != nil {
-		return err
+	return channel.DeleteWithMutationID(common.NewRequestId())
+}
+
+func (channel *Channel) DeleteWithMutationID(mutationID string) error {
+	if strings.TrimSpace(mutationID) == "" {
+		return errors.New("channel delete mutation ID is required")
 	}
-	err = channel.DeleteAbilities()
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(channel).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("channel_id = ?", channel.Id).Delete(&Ability{}).Error; err != nil {
+			return err
+		}
+		return RecordAetherChannelEventTxWithMutationID(tx, channel, "deleted", common.GetTimestamp(), mutationID)
+	})
 }
 
 var channelStatusLock sync.Mutex
@@ -704,116 +764,171 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 }
 
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
-	if common.MemoryCacheEnabled {
-		channelStatusLock.Lock()
-		defer channelStatusLock.Unlock()
-
-		channelCache, _ := CacheGetChannel(channelId)
-		if channelCache == nil {
-			return false
-		}
-		if channelCache.ChannelInfo.IsMultiKey {
-			// Use per-channel lock to prevent concurrent map read/write with GetNextEnabledKey
-			beforeStatus := channelCache.Status
-			pollingLock := GetChannelPollingLock(channelId)
-			pollingLock.Lock()
-			// 如果是多Key模式，更新缓存中的状态
-			handlerMultiKeyUpdate(channelCache, usingKey, status, reason)
-			pollingLock.Unlock()
-			if beforeStatus != channelCache.Status {
-				CacheUpdateChannelStatus(channelId, channelCache.Status)
-			}
-			//CacheUpdateChannel(channelCache)
-			//return true
-		} else {
-			// 如果缓存渠道存在，且状态已是目标状态，直接返回
-			if channelCache.Status == status {
-				return false
-			}
-			CacheUpdateChannelStatus(channelId, status)
-		}
-	}
-
-	shouldUpdateAbilities := false
-	defer func() {
-		if shouldUpdateAbilities {
-			err := UpdateAbilityStatus(channelId, status == common.ChannelStatusEnabled)
-			if err != nil {
-				common.SysLog(fmt.Sprintf("failed to update ability status: channel_id=%d, error=%v", channelId, err))
-			}
-		}
-	}()
-	channel, err := GetChannelById(channelId, true)
+	changed, err := UpdateChannelStatusWithMutationID(channelId, usingKey, status, reason, common.NewRequestId())
 	if err != nil {
+		common.SysLog(fmt.Sprintf("failed to update channel status: channel_id=%d, status=%d, error=%v", channelId, status, err))
 		return false
-	} else {
-		if channel.Status == status {
-			return false
-		}
+	}
+	return changed
+}
 
-		if channel.ChannelInfo.IsMultiKey {
-			beforeStatus := channel.Status
-			// Protect map writes with the same per-channel lock used by readers
+func UpdateChannelStatusWithMutationID(channelId int, usingKey string, status int, reason string, mutationID string) (bool, error) {
+	if channelId <= 0 || strings.TrimSpace(mutationID) == "" {
+		return false, errors.New("invalid channel status mutation")
+	}
+	var updated Channel
+	changed := false
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		if err := lockForUpdate(tx).Where("id = ?", channelId).First(&updated).Error; err != nil {
+			return err
+		}
+		if !updated.ChannelInfo.IsMultiKey && updated.Status == status {
+			return nil
+		}
+		if updated.ChannelInfo.IsMultiKey {
 			pollingLock := GetChannelPollingLock(channelId)
 			pollingLock.Lock()
-			handlerMultiKeyUpdate(channel, usingKey, status, reason)
+			handlerMultiKeyUpdate(&updated, usingKey, status, reason)
 			pollingLock.Unlock()
-			if beforeStatus != channel.Status {
-				shouldUpdateAbilities = true
-			}
 		} else {
-			info := channel.GetOtherInfo()
+			info := updated.GetOtherInfo()
 			info["status_reason"] = reason
 			info["status_time"] = common.GetTimestamp()
-			channel.SetOtherInfo(info)
-			channel.Status = status
-			shouldUpdateAbilities = true
+			updated.SetOtherInfo(info)
+			updated.Status = status
 		}
-		err = channel.SaveWithoutKey()
-		if err != nil {
-			common.SysLog(fmt.Sprintf("failed to update channel status: channel_id=%d, status=%d, error=%v", channel.Id, status, err))
-			return false
+		if err := tx.Omit("key").Save(&updated).Error; err != nil {
+			return err
 		}
+		if err := tx.Model(&Ability{}).Where("channel_id = ?", channelId).
+			Update("enabled", updated.Status == common.ChannelStatusEnabled).Error; err != nil {
+			return err
+		}
+		if err := RecordAetherChannelEventTxWithMutationID(tx, &updated, "status_updated", common.GetTimestamp(), mutationID); err != nil {
+			return err
+		}
+		changed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return true
+	if changed {
+		CacheUpdateChannel(&updated)
+	}
+	return changed, nil
+}
+
+func UpdateChannelStatusesWithMutationID(ids []int, status int, reason string, mutationID string) (int, error) {
+	if len(ids) == 0 || strings.TrimSpace(mutationID) == "" {
+		return 0, errors.New("invalid channel status batch mutation")
+	}
+	updatedChannels := make([]Channel, 0, len(ids))
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if err := lockForUpdate(tx).Where("id in (?)", ids).Order("id asc").Find(&channels).Error; err != nil {
+			return err
+		}
+		for index := range channels {
+			channel := &channels[index]
+			if channel.Status == status {
+				continue
+			}
+			if channel.ChannelInfo.IsMultiKey {
+				handlerMultiKeyUpdate(channel, "", status, reason)
+			} else {
+				info := channel.GetOtherInfo()
+				info["status_reason"] = reason
+				info["status_time"] = common.GetTimestamp()
+				channel.SetOtherInfo(info)
+				channel.Status = status
+			}
+			if err := tx.Omit("key").Save(channel).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+				Update("enabled", channel.Status == common.ChannelStatusEnabled).Error; err != nil {
+				return err
+			}
+			if err := RecordAetherChannelEventTxWithMutationID(tx, channel, "status_updated", common.GetTimestamp(), mutationID); err != nil {
+				return err
+			}
+			updatedChannels = append(updatedChannels, *channel)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for index := range updatedChannels {
+		CacheUpdateChannel(&updatedChannels[index])
+	}
+	return len(updatedChannels), nil
 }
 
 func EnableChannelByTag(tag string) error {
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", common.ChannelStatusEnabled).Error
-	if err != nil {
-		return err
-	}
-	err = UpdateAbilityStatusByTag(tag, true)
-	return err
+	return EnableChannelByTagWithMutationID(tag, common.NewRequestId())
+}
+
+func EnableChannelByTagWithMutationID(tag string, mutationID string) error {
+	return updateChannelStatusByTagWithMutationID(tag, common.ChannelStatusEnabled, "tag_enabled", mutationID)
 }
 
 func DisableChannelByTag(tag string) error {
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Update("status", common.ChannelStatusManuallyDisabled).Error
-	if err != nil {
-		return err
+	return DisableChannelByTagWithMutationID(tag, common.NewRequestId())
+}
+
+func DisableChannelByTagWithMutationID(tag string, mutationID string) error {
+	return updateChannelStatusByTagWithMutationID(tag, common.ChannelStatusManuallyDisabled, "tag_disabled", mutationID)
+}
+
+func updateChannelStatusByTagWithMutationID(tag string, status int, action string, mutationID string) error {
+	if strings.TrimSpace(tag) == "" || strings.TrimSpace(mutationID) == "" {
+		return errors.New("invalid channel tag status mutation")
 	}
-	err = UpdateAbilityStatusByTag(tag, false)
-	return err
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if err := lockForUpdate(tx).Where("tag = ?", tag).Order("id asc").Find(&channels).Error; err != nil {
+			return err
+		}
+		for index := range channels {
+			channel := &channels[index]
+			channel.Status = status
+			if err := tx.Model(channel).Update("status", status).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&Ability{}).Where("channel_id = ?", channel.Id).
+				Update("enabled", status == common.ChannelStatusEnabled).Error; err != nil {
+				return err
+			}
+			if err := RecordAetherChannelEventTxWithMutationID(tx, channel, action, common.GetTimestamp(), mutationID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *string, group *string, priority *int64, weight *uint, paramOverride *string, headerOverride *string) error {
+	return EditChannelByTagWithMutationID(tag, newTag, modelMapping, models, group, priority, weight, paramOverride, headerOverride, common.NewRequestId())
+}
+
+func EditChannelByTagWithMutationID(tag string, newTag *string, modelMapping *string, models *string, group *string, priority *int64, weight *uint, paramOverride *string, headerOverride *string, mutationID string) error {
+	if strings.TrimSpace(tag) == "" || strings.TrimSpace(mutationID) == "" {
+		return errors.New("invalid channel tag edit mutation")
+	}
 	updateData := Channel{}
-	shouldReCreateAbilities := false
-	updatedTag := tag
 	// 如果 newTag 不为空且不等于 tag，则更新 tag
 	if newTag != nil && *newTag != tag {
 		updateData.Tag = newTag
-		updatedTag = *newTag
 	}
 	if modelMapping != nil {
 		updateData.ModelMapping = modelMapping
 	}
 	if models != nil && *models != "" {
-		shouldReCreateAbilities = true
 		updateData.Models = *models
 	}
 	if group != nil && *group != "" {
-		shouldReCreateAbilities = true
 		updateData.Group = *group
 	}
 	if priority != nil {
@@ -829,27 +944,28 @@ func EditChannelByTag(tag string, newTag *string, modelMapping *string, models *
 		updateData.HeaderOverride = headerOverride
 	}
 
-	err := DB.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error
-	if err != nil {
-		return err
-	}
-	if shouldReCreateAbilities {
-		channels, err := GetChannelsByTag(updatedTag, false, false)
-		if err == nil {
-			for _, channel := range channels {
-				err = channel.UpdateAbilities(nil)
-				if err != nil {
-					common.SysLog(fmt.Sprintf("failed to update abilities: channel_id=%d, tag=%s, error=%v", channel.Id, channel.GetTag(), err))
-				}
-			}
-		}
-	} else {
-		err := UpdateAbilityByTag(tag, newTag, priority, weight)
-		if err != nil {
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if err := lockForUpdate(tx).Where("tag = ?", tag).Order("id asc").Find(&channels).Error; err != nil {
 			return err
 		}
-	}
-	return nil
+		if err := tx.Model(&Channel{}).Where("tag = ?", tag).Updates(updateData).Error; err != nil {
+			return err
+		}
+		for index := range channels {
+			channel := &channels[index]
+			if err := tx.Where("id = ?", channel.Id).First(channel).Error; err != nil {
+				return err
+			}
+			if err := channel.UpdateAbilities(tx); err != nil {
+				return err
+			}
+			if err := RecordAetherChannelEventTxWithMutationID(tx, channel, "tag_edited", common.GetTimestamp(), mutationID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func UpdateChannelUsedQuota(id int, quota int) {
@@ -868,13 +984,57 @@ func updateChannelUsedQuota(id int, quota int) {
 }
 
 func DeleteChannelByStatus(status int64) (int64, error) {
-	result := DB.Where("status = ?", status).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return DeleteChannelByStatusWithMutationID(status, common.NewRequestId())
+}
+
+func DeleteChannelByStatusWithMutationID(status int64, mutationID string) (int64, error) {
+	return deleteChannelsByStatusesWithMutationID([]int64{status}, mutationID)
 }
 
 func DeleteDisabledChannel() (int64, error) {
-	result := DB.Where("status = ? or status = ?", common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled).Delete(&Channel{})
-	return result.RowsAffected, result.Error
+	return DeleteDisabledChannelWithMutationID(common.NewRequestId())
+}
+
+func DeleteDisabledChannelWithMutationID(mutationID string) (int64, error) {
+	return deleteChannelsByStatusesWithMutationID([]int64{common.ChannelStatusAutoDisabled, common.ChannelStatusManuallyDisabled}, mutationID)
+}
+
+func deleteChannelsByStatusesWithMutationID(statuses []int64, mutationID string) (int64, error) {
+	if len(statuses) == 0 || strings.TrimSpace(mutationID) == "" {
+		return 0, errors.New("invalid channel deletion mutation")
+	}
+	var deleted int64
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if err := lockForUpdate(tx).Where("status in (?)", statuses).Order("id asc").Find(&channels).Error; err != nil {
+			return err
+		}
+		if len(channels) == 0 {
+			return nil
+		}
+		ids := make([]int, 0, len(channels))
+		for index := range channels {
+			ids = append(ids, channels[index].Id)
+		}
+		result := tx.Where("id in (?)", ids).Delete(&Channel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if err := tx.Where("channel_id in (?)", ids).Delete(&Ability{}).Error; err != nil {
+			return err
+		}
+		for index := range channels {
+			if err := RecordAetherChannelEventTxWithMutationID(tx, &channels[index], "deleted", common.GetTimestamp(), mutationID); err != nil {
+				return err
+			}
+		}
+		deleted = result.RowsAffected
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
 
 func GetPaginatedTags(offset int, limit int) ([]*string, error) {
@@ -1038,36 +1198,33 @@ func GetChannelsByIds(ids []int) ([]*Channel, error) {
 }
 
 func BatchSetChannelTag(ids []int, tag *string) error {
-	// 开启事务
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return tx.Error
-	}
+	return BatchSetChannelTagWithMutationID(ids, tag, common.NewRequestId())
+}
 
-	// 更新标签
-	err := tx.Model(&Channel{}).Where("id in (?)", ids).Update("tag", tag).Error
-	if err != nil {
-		tx.Rollback()
-		return err
+func BatchSetChannelTagWithMutationID(ids []int, tag *string, mutationID string) error {
+	if len(ids) == 0 || strings.TrimSpace(mutationID) == "" {
+		return errors.New("invalid channel batch tag mutation")
 	}
-
-	// update ability status
-	channels, err := GetChannelsByIds(ids)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-
-	for _, channel := range channels {
-		err = channel.UpdateAbilities(tx)
-		if err != nil {
-			tx.Rollback()
+	return DB.Transaction(func(tx *gorm.DB) error {
+		var channels []Channel
+		if err := lockForUpdate(tx).Where("id in (?)", ids).Order("id asc").Find(&channels).Error; err != nil {
 			return err
 		}
-	}
-
-	// 提交事务
-	return tx.Commit().Error
+		if err := tx.Model(&Channel{}).Where("id in (?)", ids).Update("tag", tag).Error; err != nil {
+			return err
+		}
+		for index := range channels {
+			channel := &channels[index]
+			channel.Tag = tag
+			if err := channel.UpdateAbilities(tx); err != nil {
+				return err
+			}
+			if err := RecordAetherChannelEventTxWithMutationID(tx, channel, "tag_updated", common.GetTimestamp(), mutationID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // CountAllChannels returns total channels in DB

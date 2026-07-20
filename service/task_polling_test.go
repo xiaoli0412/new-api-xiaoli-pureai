@@ -13,6 +13,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/bytedance/gopkg/util/gopool"
 	"github.com/stretchr/testify/assert"
@@ -330,4 +331,590 @@ func TestUpdateVideoTasksMixedChannelSleepSettings(t *testing.T) {
 
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.ElementsMatch(t, []string{"upstream_sleepy_1", "upstream_fast_1", "upstream_fast_2"}, adaptor.fetchedTaskIDs())
+}
+
+type terminalFailureTaskPollingAdaptor struct{}
+
+func (terminalFailureTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (terminalFailureTaskPollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
+	taskID, _ := body["task_id"].(string)
+	responseBody, err := common.Marshal(dto.TaskResponse[model.Task]{
+		Code: dto.TaskSuccessCode,
+		Data: model.Task{
+			TaskID:     taskID,
+			Status:     model.TaskStatusFailure,
+			Progress:   "100%",
+			FailReason: "upstream failure",
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(responseBody)),
+	}, nil
+}
+
+func (terminalFailureTaskPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
+
+func (terminalFailureTaskPollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
+type sunoTerminalFailureTaskPollingAdaptor struct{}
+
+func (sunoTerminalFailureTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (sunoTerminalFailureTaskPollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
+	ids, _ := body["ids"].([]string)
+	responseBody, err := common.Marshal(dto.TaskResponse[[]dto.SunoDataResponse]{
+		Code: dto.TaskSuccessCode,
+		Data: []dto.SunoDataResponse{{
+			TaskID:     ids[0],
+			Status:     string(model.TaskStatusFailure),
+			FailReason: "upstream failure",
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(responseBody)),
+	}, nil
+}
+
+func (sunoTerminalFailureTaskPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
+
+func (sunoTerminalFailureTaskPollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
+type sunoSuccessTaskPollingAdaptor struct{}
+
+func (sunoSuccessTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (sunoSuccessTaskPollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
+	ids, _ := body["ids"].([]string)
+	responseBody, err := common.Marshal(dto.TaskResponse[[]dto.SunoDataResponse]{
+		Code: dto.TaskSuccessCode,
+		Data: []dto.SunoDataResponse{{
+			TaskID: ids[0],
+			Status: string(model.TaskStatusSuccess),
+		}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(responseBody)),
+	}, nil
+}
+
+func (sunoSuccessTaskPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
+
+func (sunoSuccessTaskPollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return 0
+}
+
+type successfulTaskPollingAdaptor struct {
+	actualQuota int
+}
+
+func (a successfulTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (a successfulTaskPollingAdaptor) FetchTask(_ string, _ string, body map[string]any, _ string) (*http.Response, error) {
+	taskID, _ := body["task_id"].(string)
+	responseBody, err := common.Marshal(dto.TaskResponse[model.Task]{
+		Code: dto.TaskSuccessCode,
+		Data: model.Task{
+			TaskID:   taskID,
+			Status:   model.TaskStatusSuccess,
+			Progress: "100%",
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(responseBody)),
+	}, nil
+}
+
+func (a successfulTaskPollingAdaptor) ParseTaskResult([]byte) (*relaycommon.TaskInfo, error) {
+	return nil, nil
+}
+
+func (a successfulTaskPollingAdaptor) AdjustBillingOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) int {
+	return a.actualQuota
+}
+
+func (a successfulTaskPollingAdaptor) ActualQuotaOnComplete(_ *model.Task, _ *relaycommon.TaskInfo) (int, bool) {
+	return a.actualQuota, true
+}
+
+type unknownQuotaTaskPollingAdaptor struct {
+	taskcommon.BaseBilling
+}
+
+func (unknownQuotaTaskPollingAdaptor) Init(_ *relaycommon.RelayInfo) {}
+
+func (unknownQuotaTaskPollingAdaptor) FetchTask(baseURL string, key string, body map[string]any, proxy string) (*http.Response, error) {
+	return successfulTaskPollingAdaptor{}.FetchTask(baseURL, key, body, proxy)
+}
+
+func (unknownQuotaTaskPollingAdaptor) ParseTaskResult(body []byte) (*relaycommon.TaskInfo, error) {
+	return successfulTaskPollingAdaptor{}.ParseTaskResult(body)
+}
+
+func seedBrokenAetherIntegration(t *testing.T, channelID int, instanceID string) *model.AetherIntegration {
+	t.Helper()
+	integration := &model.AetherIntegration{
+		ChannelID:                   channelID,
+		InstanceID:                  instanceID,
+		ExecutionMode:               model.AetherExecutionModeDirectChannel,
+		Enabled:                     true,
+		ConfigRevision:              1,
+		ControlSecretEncrypted:      "invalid-secret",
+		RelaySigningSecretEncrypted: "invalid-secret",
+	}
+	require.NoError(t, model.DB.Create(integration).Error)
+	return integration
+}
+
+func repairAetherIntegrationSecrets(t *testing.T, integration *model.AetherIntegration) {
+	t.Helper()
+	require.NoError(t, integration.SetSecrets("control-secret", "relay-signing-secret"))
+	require.NoError(t, model.DB.Save(integration).Error)
+}
+
+func TestChannelLookupFailureLeavesSunoAndVideoTasksRetryable(t *testing.T) {
+	truncate(t)
+
+	const missingChannelID = 404
+	sunoTask := makeTask(404, missingChannelID, 100, 0, BillingSourceWallet, 0)
+	sunoTask.TaskID = "suno-channel-cache-miss"
+	sunoTask.PrivateData.UpstreamTaskID = "upstream-suno-channel-cache-miss"
+	videoTask := makeTask(405, missingChannelID, 100, 0, BillingSourceWallet, 0)
+	videoTask.TaskID = "video-channel-cache-miss"
+	videoTask.PrivateData.UpstreamTaskID = "upstream-video-channel-cache-miss"
+	require.NoError(t, model.DB.Create(sunoTask).Error)
+	require.NoError(t, model.DB.Create(videoTask).Error)
+
+	err := updateSunoTasks(context.Background(), missingChannelID, []string{sunoTask.GetUpstreamTaskID()}, map[string]*model.Task{
+		sunoTask.GetUpstreamTaskID(): sunoTask,
+	})
+	require.Error(t, err)
+	require.NoError(t, UpdateVideoTasks(context.Background(), constant.TaskPlatform("kling"), map[int][]string{
+		missingChannelID: {videoTask.GetUpstreamTaskID()},
+	}, map[string]*model.Task{
+		videoTask.GetUpstreamTaskID(): videoTask,
+	}))
+
+	var reloadedSuno, reloadedVideo model.Task
+	require.NoError(t, model.DB.First(&reloadedSuno, sunoTask.ID).Error)
+	require.NoError(t, model.DB.First(&reloadedVideo, videoTask.ID).Error)
+	assert.EqualValues(t, model.TaskStatusInProgress, reloadedSuno.Status)
+	assert.EqualValues(t, model.TaskStatusInProgress, reloadedVideo.Status)
+}
+
+func TestSunoPollDoesNotOverwriteConcurrentFailureTransition(t *testing.T) {
+	truncate(t)
+
+	const channelID = 406
+	baseURL := "https://suno.example.test"
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id:      channelID,
+		Type:    constant.ChannelTypeSunoAPI,
+		Key:     "sk-test",
+		BaseURL: &baseURL,
+		Status:  common.ChannelStatusEnabled,
+	}).Error)
+	task := makeTask(406, channelID, 100, 0, BillingSourceWallet, 0)
+	task.TaskID = "suno-stale-success"
+	task.PrivateData.UpstreamTaskID = "upstream-suno-stale-success"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	staleTask := *task
+	require.NoError(t, model.DB.Model(&model.Task{}).Where("id = ?", task.ID).Update("status", model.TaskStatusFailure).Error)
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor { return sunoSuccessTaskPollingAdaptor{} }
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	require.NoError(t, updateSunoTasks(context.Background(), channelID, []string{staleTask.GetUpstreamTaskID()}, map[string]*model.Task{
+		staleTask.GetUpstreamTaskID(): &staleTask,
+	}))
+
+	var reloaded model.Task
+	require.NoError(t, model.DB.First(&reloaded, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, reloaded.Status)
+}
+
+func TestVideoSuccessSettlementOutboxFailureKeepsTaskRetryable(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 407, 407, 407
+	const preConsumed, actualQuota = 500, 300
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-video-success-outbox", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", preConsumed).Error)
+	baseURL := "https://video.example.test"
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(channel).Error)
+	integration := seedBrokenAetherIntegration(t, channelID, "aether-video-success-outbox")
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "video-success-outbox"
+	task.PrivateData.UpstreamTaskID = "upstream-video-success-outbox"
+	task.Progress = "30%"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	err := updateVideoSingleTask(context.Background(), successfulTaskPollingAdaptor{actualQuota: actualQuota}, channel, task.GetUpstreamTaskID(), map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	})
+	require.Error(t, err)
+	var afterFailure model.Task
+	require.NoError(t, model.DB.First(&afterFailure, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusInProgress, afterFailure.Status)
+	assert.Equal(t, preConsumed, afterFailure.Quota)
+	assert.Zero(t, getUserQuota(t, userID))
+	assert.Zero(t, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, preConsumed, getTokenUsedQuota(t, tokenID))
+
+	repairAetherIntegrationSecrets(t, integration)
+	var retryTask model.Task
+	require.NoError(t, model.DB.First(&retryTask, task.ID).Error)
+	require.NoError(t, updateVideoSingleTask(context.Background(), successfulTaskPollingAdaptor{actualQuota: actualQuota}, channel, retryTask.GetUpstreamTaskID(), map[string]*model.Task{
+		retryTask.GetUpstreamTaskID(): &retryTask,
+	}))
+	var completed model.Task
+	require.NoError(t, model.DB.First(&completed, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, completed.Status)
+	assert.Equal(t, actualQuota, completed.Quota)
+	assert.Equal(t, preConsumed-actualQuota, getUserQuota(t, userID))
+	assert.Equal(t, preConsumed-actualQuota, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, actualQuota, getTokenUsedQuota(t, tokenID))
+	var eventCount int64
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Where("event_type = ?", model.AetherLedgerEventFinancial).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), eventCount)
+}
+
+func TestVideoSuccessSettlesActualQuotaZero(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 408, 408, 408
+	const preConsumed = 500
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-video-success-zero", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", preConsumed).Error)
+	baseURL := "https://video.example.test"
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(channel).Error)
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "video-success-zero"
+	task.PrivateData.UpstreamTaskID = "upstream-video-success-zero"
+	task.Progress = "30%"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	require.NoError(t, updateVideoSingleTask(context.Background(), successfulTaskPollingAdaptor{actualQuota: 0}, channel, task.GetUpstreamTaskID(), map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	}))
+
+	var completed model.Task
+	require.NoError(t, model.DB.First(&completed, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, completed.Status)
+	assert.Zero(t, completed.Quota)
+	assert.Equal(t, preConsumed, getUserQuota(t, userID))
+	assert.Equal(t, preConsumed, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+}
+
+func TestVideoSuccessRejectsNegativeKnownActualQuota(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 410, 410, 410
+	const preConsumed = 500
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-video-success-negative", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", preConsumed).Error)
+	baseURL := "https://video.example.test"
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(channel).Error)
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "video-success-negative"
+	task.PrivateData.UpstreamTaskID = "upstream-video-success-negative"
+	task.Progress = "30%"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	err := updateVideoSingleTask(context.Background(), successfulTaskPollingAdaptor{actualQuota: -1}, channel, task.GetUpstreamTaskID(), map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	})
+	require.ErrorContains(t, err, "task actual quota cannot be negative")
+
+	var afterFailure model.Task
+	require.NoError(t, model.DB.First(&afterFailure, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusInProgress, afterFailure.Status)
+	assert.Equal(t, preConsumed, afterFailure.Quota)
+	assert.Zero(t, getUserQuota(t, userID))
+	assert.Zero(t, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, preConsumed, getTokenUsedQuota(t, tokenID))
+}
+
+func TestVideoSuccessPerCallRejectsNegativeKnownActualQuota(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 411, 411, 411
+	const preConsumed = 500
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-video-success-per-call-negative", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", preConsumed).Error)
+	baseURL := "https://video.example.test"
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(channel).Error)
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "video-success-per-call-negative"
+	task.PrivateData.UpstreamTaskID = "upstream-video-success-per-call-negative"
+	task.PrivateData.BillingContext.PerCallBilling = true
+	task.Progress = "30%"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	err := updateVideoSingleTask(context.Background(), successfulTaskPollingAdaptor{actualQuota: -1}, channel, task.GetUpstreamTaskID(), map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	})
+	require.ErrorContains(t, err, "task actual quota cannot be negative")
+
+	var afterFailure model.Task
+	require.NoError(t, model.DB.First(&afterFailure, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusInProgress, afterFailure.Status)
+	assert.Equal(t, preConsumed, afterFailure.Quota)
+	assert.Zero(t, getUserQuota(t, userID))
+	assert.Zero(t, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, preConsumed, getTokenUsedQuota(t, tokenID))
+}
+
+func TestVideoSuccessKeepsPreConsumedQuotaWhenActualQuotaUnknown(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID = 409, 409, 409
+	const preConsumed = 500
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-video-success-unknown", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", preConsumed).Error)
+	baseURL := "https://video.example.test"
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test", BaseURL: &baseURL, Status: common.ChannelStatusEnabled}
+	require.NoError(t, model.DB.Create(channel).Error)
+	task := makeTask(userID, channelID, preConsumed, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "video-success-unknown"
+	task.PrivateData.UpstreamTaskID = "upstream-video-success-unknown"
+	task.Progress = "30%"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	require.NoError(t, updateVideoSingleTask(context.Background(), unknownQuotaTaskPollingAdaptor{}, channel, task.GetUpstreamTaskID(), map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	}))
+
+	var completed model.Task
+	require.NoError(t, model.DB.First(&completed, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusSuccess, completed.Status)
+	assert.Equal(t, preConsumed, completed.Quota)
+	assert.Zero(t, getUserQuota(t, userID))
+	assert.Zero(t, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, preConsumed, getTokenUsedQuota(t, tokenID))
+}
+
+func TestSunoTerminalFailureRetriesRefundAfterOutboxFailureBeforeCommittingStatus(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID, quota = 403, 403, 403, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-suno-terminal-refund-retry", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	baseURL := "https://suno.example.test"
+	require.NoError(t, model.DB.Create(&model.Channel{
+		Id:      channelID,
+		Type:    constant.ChannelTypeSunoAPI,
+		Key:     "sk-test",
+		BaseURL: &baseURL,
+		Status:  common.ChannelStatusEnabled,
+	}).Error)
+	integration := seedBrokenAetherIntegration(t, channelID, "aether-suno-terminal-refund-retry")
+
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "suno-terminal-refund-retry"
+	task.PrivateData.UpstreamTaskID = "upstream-suno-terminal-refund-retry"
+	task.Progress = "30%"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	previousFactory := GetTaskAdaptorFunc
+	GetTaskAdaptorFunc = func(constant.TaskPlatform) TaskPollingAdaptor {
+		return sunoTerminalFailureTaskPollingAdaptor{}
+	}
+	t.Cleanup(func() { GetTaskAdaptorFunc = previousFactory })
+
+	err := updateSunoTasks(context.Background(), channelID, []string{task.GetUpstreamTaskID()}, map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	})
+	require.Error(t, err, "failed outbox must leave Suno task retryable")
+
+	var afterFailure model.Task
+	require.NoError(t, model.DB.First(&afterFailure, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusInProgress, afterFailure.Status)
+	assert.Equal(t, 0, getUserQuota(t, userID))
+	assert.Equal(t, 0, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, quota, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, claimCount)
+	assert.Zero(t, eventCount)
+
+	repairAetherIntegrationSecrets(t, integration)
+	var retryTask model.Task
+	require.NoError(t, model.DB.First(&retryTask, task.ID).Error)
+	require.NoError(t, updateSunoTasks(context.Background(), channelID, []string{retryTask.GetUpstreamTaskID()}, map[string]*model.Task{
+		retryTask.GetUpstreamTaskID(): &retryTask,
+	}))
+
+	var completed model.Task
+	require.NoError(t, model.DB.First(&completed, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, completed.Status)
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+}
+
+func TestTerminalFailureRetriesRefundAfterOutboxFailureBeforeCommittingStatus(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID, quota = 401, 401, 401, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-terminal-refund-retry", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	seedTaskPollingChannel(t, channelID, true)
+	integration := seedBrokenAetherIntegration(t, channelID, "aether-terminal-refund-retry")
+
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "terminal-refund-retry"
+	task.PrivateData.UpstreamTaskID = "upstream-terminal-refund-retry"
+	task.Progress = "30%"
+	require.NoError(t, model.DB.Create(task).Error)
+
+	channel := &model.Channel{Id: channelID, Type: constant.ChannelTypeKling, Key: "sk-test"}
+	adaptor := terminalFailureTaskPollingAdaptor{}
+	err := updateVideoSingleTask(context.Background(), adaptor, channel, task.GetUpstreamTaskID(), map[string]*model.Task{
+		task.GetUpstreamTaskID(): task,
+	})
+	require.Error(t, err, "failed outbox must keep the terminal transition retryable")
+
+	var afterFailure model.Task
+	require.NoError(t, model.DB.First(&afterFailure, task.ID).Error)
+	require.EqualValues(t, model.TaskStatusInProgress, afterFailure.Status)
+	assert.Equal(t, 0, getUserQuota(t, userID))
+	assert.Equal(t, 0, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, quota, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, claimCount)
+	assert.Zero(t, eventCount)
+
+	repairAetherIntegrationSecrets(t, integration)
+	var retryTask model.Task
+	require.NoError(t, model.DB.First(&retryTask, task.ID).Error)
+	require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, channel, retryTask.GetUpstreamTaskID(), map[string]*model.Task{
+		retryTask.GetUpstreamTaskID(): &retryTask,
+	}))
+
+	var completed model.Task
+	require.NoError(t, model.DB.First(&completed, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, completed.Status)
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+
+	var duplicatePollTask model.Task
+	require.NoError(t, model.DB.First(&duplicatePollTask, task.ID).Error)
+	require.NoError(t, updateVideoSingleTask(context.Background(), adaptor, channel, duplicatePollTask.GetUpstreamTaskID(), map[string]*model.Task{
+		duplicatePollTask.GetUpstreamTaskID(): &duplicatePollTask,
+	}))
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+}
+
+func TestTimeoutRetriesRefundAfterOutboxFailureBeforeCommittingStatus(t *testing.T) {
+	truncate(t)
+
+	const userID, tokenID, channelID, quota = 402, 402, 402, 100
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "sk-timeout-refund-retry", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("used_quota", quota).Error)
+	seedTaskPollingChannel(t, channelID, true)
+	integration := seedBrokenAetherIntegration(t, channelID, "aether-timeout-refund-retry")
+
+	task := makeTask(userID, channelID, quota, tokenID, BillingSourceWallet, 0)
+	task.TaskID = "timeout-refund-retry"
+	task.Progress = "30%"
+	task.SubmitTime = time.Now().Add(-2 * time.Minute).Unix()
+	require.NoError(t, model.DB.Create(task).Error)
+
+	previousTimeout := constant.TaskTimeoutMinutes
+	constant.TaskTimeoutMinutes = 1
+	t.Cleanup(func() { constant.TaskTimeoutMinutes = previousTimeout })
+
+	sweepTimedOutTasks(context.Background())
+
+	var afterFailure model.Task
+	require.NoError(t, model.DB.First(&afterFailure, task.ID).Error)
+	require.EqualValues(t, model.TaskStatusInProgress, afterFailure.Status)
+	assert.Equal(t, 0, getUserQuota(t, userID))
+	assert.Equal(t, 0, getTokenRemainQuota(t, tokenID))
+	assert.Equal(t, quota, getTokenUsedQuota(t, tokenID))
+	var claimCount, eventCount int64
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Zero(t, claimCount)
+	assert.Zero(t, eventCount)
+
+	repairAetherIntegrationSecrets(t, integration)
+	sweepTimedOutTasks(context.Background())
+
+	var completed model.Task
+	require.NoError(t, model.DB.First(&completed, task.ID).Error)
+	assert.EqualValues(t, model.TaskStatusFailure, completed.Status)
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	assert.Zero(t, getTokenUsedQuota(t, tokenID))
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
+
+	sweepTimedOutTasks(context.Background())
+	assert.Equal(t, quota, getUserQuota(t, userID))
+	assert.Equal(t, quota, getTokenRemainQuota(t, tokenID))
+	require.NoError(t, model.DB.Model(&model.BillingRefundClaim{}).Count(&claimCount).Error)
+	require.NoError(t, model.DB.Model(&model.AetherLedgerEvent{}).Count(&eventCount).Error)
+	assert.Equal(t, int64(1), claimCount)
+	assert.Equal(t, int64(1), eventCount)
 }

@@ -1,0 +1,9 @@
+{
+  "0 = use global default": "0 = use global default",
+  "Concurrent Requests Limit": "Concurrent Requests Limit",
+  "Maximum concurrent requests for this user. 0 = unlimited or use global default.": "Maximum concurrent requests for this user. 0 = unlimited or use global default.",
+  "Maximum successful requests per minute for this user. 0 = unlimited or use global default.": "Maximum successful requests per minute for this user. 0 = unlimited or use global default.",
+  "Rate Limit Settings": "Rate Limit Settings",
+  "RPM (Requests Per Minute)": "RPM (Requests Per Minute)",
+  "Set per-user request rate limits. 0 means using the global default.": "Set per-user request rate limits. 0 means using the global default."
+}

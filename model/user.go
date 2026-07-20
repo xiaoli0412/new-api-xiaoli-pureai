@@ -49,7 +49,7 @@ type User struct {
 	LinuxDOId        string                     `json:"linux_do_id" gorm:"column:linux_do_id;index"`
 	Setting          string                     `json:"setting" gorm:"type:text;column:setting"`
 	RequestRateLimit int                        `json:"request_rate_limit" gorm:"type:int;default:0;column:request_rate_limit"` // 用户级别 RPM 限制，0 表示使用全局默认值
-	ConcurrentLimit  int                        `json:"concurrent_limit" gorm:"type:int;default:0;column:concurrent_limit"`    // 用户级别并发请求限制，0 表示使用全局默认值
+	ConcurrentLimit  int                        `json:"concurrent_limit" gorm:"type:int;default:0;column:concurrent_limit"`     // 用户级别并发请求限制，0 表示使用全局默认值
 	Remark           string                     `json:"remark,omitempty" gorm:"type:varchar(255)" validate:"max=255"`
 	StripeCustomer   string                     `json:"stripe_customer" gorm:"type:varchar(64);column:stripe_customer;index"`
 	CreatedAt        int64                      `json:"created_at" gorm:"autoCreateTime;column:created_at"`
@@ -1057,8 +1057,42 @@ func GetUserSetting(id int, fromDB bool) (settingMap dto.UserSetting, err error)
 }
 
 func IncreaseUserQuota(id int, quota int, db bool) (err error) {
+	err = IncreaseUserQuotaTx(DB, id, quota)
+	if err != nil {
+		return err
+	}
+	IncreaseUserQuotaCache(id, quota)
+	return nil
+}
+
+func IncreaseUserQuotaTx(tx *gorm.DB, id int, quota int) error {
+	if tx == nil {
+		return errors.New("user quota transaction is required")
+	}
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
+	}
+	if quota == 0 {
+		return nil
+	}
+	if quota > common.MaxQuota {
+		return errors.New("quota 超出允许范围！")
+	}
+	result := tx.Model(&User{}).
+		Where("id = ? AND quota <= ?", id, common.MaxQuota-quota).
+		Update("quota", gorm.Expr("quota + ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("额度超过允许上限！")
+	}
+	return nil
+}
+
+func IncreaseUserQuotaCache(id int, quota int) {
+	if quota <= 0 {
+		return
 	}
 	gopool.Go(func() {
 		err := cacheIncrUserQuota(id, int64(quota))
@@ -1066,31 +1100,52 @@ func IncreaseUserQuota(id int, quota int, db bool) (err error) {
 			common.SysLog("failed to increase user quota: " + err.Error())
 		}
 	})
-	if !db && common.BatchUpdateEnabled {
-		addNewRecord(BatchUpdateTypeUserQuota, id, quota)
-		return nil
-	}
-	return increaseUserQuota(id, quota)
 }
 
-func increaseUserQuota(id int, quota int) (err error) {
-	err = DB.Model(&User{}).Where("id = ?", id).Update("quota", gorm.Expr("quota + ?", quota)).Error
-	if err != nil {
-		return err
+// DecreaseUserQuotaTx applies a billing debit directly to the main database.
+// It deliberately bypasses the batch updater so callers can compose it with
+// token, subscription, state, and outbox mutations in one transaction.
+func DecreaseUserQuotaTx(tx *gorm.DB, id int, quota int) error {
+	if tx == nil {
+		return errors.New("user quota transaction is required")
 	}
-	return err
+	if id <= 0 {
+		return errors.New("invalid user ID")
+	}
+	if quota < 0 {
+		return errors.New("quota 不能为负数！")
+	}
+	if quota == 0 {
+		return nil
+	}
+	result := tx.Model(&User{}).
+		Where("id = ? AND quota >= ?", id, quota).
+		Update("quota", gorm.Expr("quota - ?", quota))
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errors.New("用户额度不足！")
+	}
+	return nil
+}
+
+func DecreaseUserQuotaCache(id int, quota int) {
+	if quota <= 0 {
+		return
+	}
+	gopool.Go(func() {
+		if err := cacheDecrUserQuota(id, int64(quota)); err != nil {
+			common.SysLog("failed to decrease user quota: " + err.Error())
+		}
+	})
 }
 
 func DecreaseUserQuota(id int, quota int, db bool) (err error) {
 	if quota < 0 {
 		return errors.New("quota 不能为负数！")
 	}
-	gopool.Go(func() {
-		err := cacheDecrUserQuota(id, int64(quota))
-		if err != nil {
-			common.SysLog("failed to decrease user quota: " + err.Error())
-		}
-	})
+	DecreaseUserQuotaCache(id, quota)
 	if !db && common.BatchUpdateEnabled {
 		addNewRecord(BatchUpdateTypeUserQuota, id, -quota)
 		return nil
